@@ -1,35 +1,79 @@
 # afyapowers-core
 
-Plugin de contexto de sessão da família **afyapowers** para o **Claude Code**. Contém a status line e os hooks de contexto que funcionam de forma independente do workflow do [afyapowers](https://github.com/afya/afyapowers) — instale este plugin mesmo em projetos que não usam o workflow de fases.
+Plugin core da família **afyapowers** para o **Claude Code**, responsável por fornecer contexto de Jira, status line, histórico de conversas em HTML, telemetria OTLP e diretiva de idioma pt-BR.
+
+Funciona de forma independente do workflow de fases do [afyapowers](https://github.com/afya/afyapowers) — instale este plugin mesmo em projetos que não usam o workflow.
 
 > **Apenas Claude Code.** Diferente do afyapowers, este plugin não tem distribuições para Cursor, Gemini ou GitHub Copilot.
 
-## Componentes
+## Visão geral
 
 | Componente | Evento(s) | O que faz |
 |---|---|---|
-| `hooks/jira-context` | `UserPromptSubmit` | Injeta o ticket Jira atual (`.afyapowers/current-jira-ticket`) como contexto do prompt e mantém o `.afyapowers/.gitignore` |
-| `hooks/lang-directive` | `PreToolUse` (Skill), `UserPromptExpansion` | Reinjeta a diretiva de idioma pt-BR quando qualquer skill `afyapowers*:` é invocada |
-| `hooks/render-history` | `SessionEnd` | Renderiza a conversa da sessão em HTML autocontido (`.afyapowers/history/claude/`, ou `~/.claude/afyapowers-core/history/<projeto>/claude/` em projetos sem `.afyapowers/`) |
-| `hooks/otel-context` | `SessionStart`, `UserPromptSubmit`, `SessionEnd` | Emite log records OTLP com contexto de git/Jira/versão (ver [Telemetria](#telemetria-opentelemetry)) |
-| `hooks/refresh-plugin-root` | `SessionStart` | Regrava o ponteiro `~/.claude/afyapowers-core/plugin-root` usado pela status line |
-| `scripts/statusline.py` + `/afyapowers-core:statusline` | — | Status line opt-in: marca afyapowers, modelo, contexto, ticket Jira, git, custo e duração |
+| [`hooks/jira-context`](#contexto-de-jira) | `UserPromptSubmit` | Confirma e injeta o ticket Jira atual como contexto de cada prompt |
+| [`hooks/lang-directive`](#diretiva-de-idioma-pt-br) | `PreToolUse` (Skill), `UserPromptExpansion` | Reinjeta a diretiva de idioma pt-BR quando qualquer skill `afyapowers*:` é invocada |
+| [`hooks/render-history`](#histórico-de-conversas) | `SessionEnd` | Renderiza a conversa da sessão em HTML autocontido |
+| [`hooks/otel-context`](#telemetria-opentelemetry) | `SessionStart`, `UserPromptSubmit`, `SessionEnd` | Emite log records OTLP com contexto de git/Jira/versão |
+| [`hooks/refresh-plugin-root`](#ponteiro-de-instalação-e-pré-requisitos) | `SessionStart` | Regrava o ponteiro usado pela status line e avisa se o Python está ausente |
+| [`scripts/statusline.py`](#status-line) + `/afyapowers-core:statusline` | — | Status line opt-in: marca afyapowers, modelo, contexto, ticket Jira, git, custo e duração |
 
 **Requisito de runtime:** Python 3.9+ no PATH (`python3`).
 
-Os hooks nunca criam o diretório `.afyapowers/` — a presença dele é o que marca um projeto como afyapowers-enabled, e sua criação é responsabilidade do plugin afyapowers (`/afyapowers:new`). Em projetos sem `.afyapowers/`, os hooks degradam graciosamente (sem ticket Jira, history no diretório global).
+### Garantias de execução
 
-## Status line
+Todos os hooks seguem o mesmo contrato:
 
-Instalação (global, vale para todos os projetos do usuário):
+- **Nunca bloqueiam a sessão.** São observabilidade/enriquecimento de contexto: qualquer erro resulta em `exit 0` silencioso, nunca em prompt travado ou sessão quebrada.
+- **Nunca criam `.afyapowers/`.** A presença desse diretório é o que marca um projeto como afyapowers-enabled, e sua criação é responsabilidade do plugin afyapowers (`/afyapowers:new`). Em projetos sem `.afyapowers/`, os hooks degradam graciosamente: sem fluxo de ticket persistido, history vai para o diretório global e a telemetria emite `jira.key: null`.
+- **Trabalho pesado fora do caminho crítico.** O que envolve git ou rede (telemetria) roda em processo filho destacado; o hook em si retorna em milissegundos.
+
+## Componentes
+
+### Contexto de Jira
+
+`hooks/jira-context` (`UserPromptSubmit`) é o dono do fluxo de ticket Jira. A cada prompt, dentro de um repositório git, ele:
+
+1. **Lê o ponteiro** `.afyapowers/current-jira-ticket` (uma linha: a chave do ticket, ex. `ABC-123`, ou o literal `none` para "sem ticket").
+2. **Extrai uma sugestão da branch** atual (padrão `ABC-123` no nome da branch).
+3. **Injeta uma instrução junto com o prompt do usuário** para que o modelo confirme o ticket como primeira ação do turno — uma vez por sessão, e novamente quando o assunto da conversa muda de tarefa. Ponteiro vazio, ausente ou em conflito com a branch vira pergunta ao usuário (via `AskUserQuestion`), com a chave da branch como opção recomendada.
+4. **Persiste a resposta** de volta no ponteiro, que alimenta a status line e a telemetria.
+
+O hook também mantém o `.afyapowers/.gitignore` (quando o diretório existe), garantindo que ponteiro de ticket, marcador de feature ativa, history e logs de debug fiquem fora do versionamento. Fora de um repositório git ele não faz nada — um ticket só faz sentido atado a um projeto.
+
+### Diretiva de idioma pt-BR
+
+`hooks/lang-directive` reinjeta a diretiva de idioma da família afyapowers no momento em que ela é mais necessária: quando uma skill `afyapowers*:` é invocada — pelo modelo (`PreToolUse` no tool `Skill`) ou pelo usuário via slash command (`UserPromptExpansion`).
+
+A diretiva instrui o modelo a conversar e escrever todos os artefatos afyapowers em português do Brasil, tratando os templates em inglês dentro das skills como guia de conteúdo (não texto final), mantendo em inglês os termos técnicos convencionais e os identificadores de fase do workflow, e nunca traduzindo código, identificadores ou caminhos de arquivo.
+
+Injetar por skill (em vez de a cada prompt) mantém a diretiva próxima da ação sem custo de tokens em turnos que não usam afyapowers.
+
+### Histórico de conversas
+
+`hooks/render-history` (`SessionEnd`) lê o transcript JSONL da sessão e renderiza **um HTML interativo e autocontido por sessão**, mais um `index.html` regenerado com a lista de sessões. Conversas de subagentes (tool `Agent`) são seguidas recursivamente e renderizadas aninhadas sob a chamada que as criou.
+
+Destino dos arquivos:
+
+- Projetos afyapowers-enabled: `.afyapowers/history/claude/` (ignorado pelo git via `.afyapowers/.gitignore`).
+- Demais projetos: `~/.claude/afyapowers-core/history/<projeto>/claude/` — todo projeto tem histórico, nenhum ganha um `.afyapowers/` que não pediu.
+
+### Status line
+
+Opt-in, instalada **globalmente** (vale para todos os projetos do usuário):
 
 ```
 /afyapowers-core:statusline
 ```
 
-Remoção: `/afyapowers-core:statusline remove`.
+Mostra no rodapé do Claude Code: a marca afyapowers, modelo e uso de contexto, o ticket Jira atual (resolvido por projeto a partir do diretório da sessão; omitido em projetos sem afyapowers), branch/estado do git, custo e duração da sessão.
 
-A entrada `statusLine` em `~/.claude/settings.json` resolve o script através do ponteiro `~/.claude/afyapowers-core/plugin-root`, regravado a cada início de sessão pelo hook `refresh-plugin-root` — assim ela sobrevive a upgrades de versão do plugin, que mudam o caminho de instalação.
+Remoção: `/afyapowers-core:statusline remove`. O instalador é idempotente: mescla apenas a chave `statusLine` em `~/.claude/settings.json` e, na remoção, deleta apenas ela — nunca sobrescreve um settings quebrado.
+
+A entrada `statusLine` resolve o script através do ponteiro `~/.claude/afyapowers-core/plugin-root`, regravado a cada início de sessão pelo hook `refresh-plugin-root` — assim ela sobrevive a upgrades de versão do plugin, que mudam o caminho de instalação.
+
+### Ponteiro de instalação e pré-requisitos
+
+`hooks/refresh-plugin-root` (`SessionStart`) regrava o ponteiro `~/.claude/afyapowers-core/plugin-root` com o caminho da versão instalada do plugin (é ele que mantém a status line funcionando após upgrades) e emite um aviso não-bloqueante na sessão quando o `python3` não está no PATH — já que todos os demais hooks e a status line são Python.
 
 ## Telemetria (OpenTelemetry)
 
@@ -126,7 +170,7 @@ sai `0` em qualquer erro.
 .claude-plugin/plugin.json   # Manifesto do plugin
 hooks/
   hooks.json                 # Registro dos hooks
-  refresh-plugin-root        # Ponteiro da status line (SessionStart)
+  refresh-plugin-root        # Ponteiro da status line + aviso de Python (SessionStart)
   jira-context               # Contexto de ticket Jira (UserPromptSubmit)
   lang-directive             # Diretiva de idioma pt-BR (PreToolUse/UserPromptExpansion)
   render-history             # Histórico da conversa em HTML (SessionEnd)
