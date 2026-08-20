@@ -90,8 +90,10 @@ ensure_gitignore() {
   printf '%s' "$missing" >> "$gi" 2>/dev/null || true
 }
 
-# Outside a git repo otel-context never emits (git_attrs -> None skips the
-# record), so a ticket would be collected and never sent — stay silent.
+# Only run inside a git work tree. WRITE_RULES instructs the model to CREATE
+# `.afyapowers/` wherever it is, so injecting it in an arbitrary directory
+# (home, Downloads, a scratch folder) would scatter `.afyapowers/` across the
+# user's filesystem. A ticket only makes sense attached to a project anyway.
 if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]; then
   exit 0
 fi
