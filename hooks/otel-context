@@ -365,6 +365,34 @@ def jira_key(cwd):
 
 
 # --------------------------------------------------------------------------- #
+# Active feature phase (child only)
+# --------------------------------------------------------------------------- #
+
+def feature_phase(cwd):
+    """Current workflow phase of the active afyapowers-dev feature.
+
+    Optional by design: a missing file, an empty/`null` pointer, an unsafe
+    slug or an absent `current_phase:` line all mean the attribute is not
+    emitted at all (unlike jira.key, which is always present as an explicit
+    null). state.yaml is read with a line scan instead of a YAML parser to
+    stay stdlib-only; anchoring on column 0 skips the indented per-phase
+    entries under `phases:`.
+    """
+    try:
+        features = Path(cwd) / ".afyapowers" / "features"
+        slug = (features / "active").read_text(encoding="utf-8").strip()
+        if not slug or slug.lower() == "null" or Path(slug).name != slug:
+            return None
+        text = (features / slug / "state.yaml").read_text(encoding="utf-8")
+    except Exception:
+        return None
+    for line in text.splitlines():
+        if line.startswith("current_phase:"):
+            return line[len("current_phase:"):].strip() or None
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Git attributes (child only)
 # --------------------------------------------------------------------------- #
 
@@ -603,9 +631,11 @@ def emit(config, payload):
 
     Once we are here the emitter is configured and routable, so a record goes
     out unconditionally: no input is treated as a reason to stay silent. Every
-    attribute below is always present — a real value or an explicit null — so a
-    session outside a repo, before the first prompt, or without a ticket is
-    still visible in the backend rather than absent from it.
+    fixed-schema attribute below is always present — a real value or an explicit
+    null — so a session outside a repo, before the first prompt, or without a
+    ticket is still visible in the backend rather than absent from it. Optional
+    attributes (plugin versions, feature phase) are instead omitted entirely
+    when they have no value.
     """
     cwd = config["cwd"]
 
@@ -622,6 +652,11 @@ def emit(config, payload):
         "afyapowers.version": plugin_version() or ATTR_NULL,
         **git_attrs(cwd, config["git_dirty"]),
     }
+    # Optional workflow context: only present when an afyapowers-dev feature is
+    # active and its state.yaml names a phase — never emitted as null.
+    phase = feature_phase(cwd)
+    if phase:
+        attrs["afyapowers_dev.current_phase"] = phase
     # Per-plugin versions of the whole afyapowers family. Ordering is the
     # collision rule: a plugin literally named "afyapowers" maps to
     # "afyapowers.version" and takes the key over the manifest value above
