@@ -1,0 +1,8 @@
+{
+  "name": "afyapowers-core",
+  "description": "Contexto de sessão compartilhado da família afyapowers: status line, contexto de Jira, diretiva de idioma pt-BR, histórico de conversas em HTML e telemetria OTLP.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Afya"
+  }
+}
