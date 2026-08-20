@@ -3,6 +3,7 @@
   "description": "Plugin core da família afyapowers, responsável por fornecer contexto de Jira, status line, histórico de conversas em HTML, telemetria OTLP e diretiva de idioma pt-BR.",
   "version": "1.0.0",
   "author": {
-    "name": "Afya"
+    "name": "Rafael Papastamatiou",
+    "email": "rafael.rodrigues@afya.com.br"
   }
 }
