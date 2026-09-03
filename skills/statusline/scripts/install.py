@@ -8,9 +8,10 @@ into the user's `~/.claude/settings.json` — never touching other keys, so
 the status line applies to every project on this machine. `--remove`
 deletes only that entry.
 
-The status line script itself resolves per-project state (active feature,
-Jira ticket) from the session's working directory at run time, so projects
-without afyapowers simply omit those segments.
+The status line script itself resolves the Jira ticket per session (by the
+`session_id` Claude Code pipes to it, from `~/.claude/afyapowers-core/sessions/`)
+and git state from the session's working directory at run time, so segments
+without a value are simply omitted.
 
 Prints `ok=true` on success, `ok=false` + stderr detail on failure.
 """

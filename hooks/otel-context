@@ -341,21 +341,41 @@ def afyapowers_plugin_versions(cwd):
 
 
 # --------------------------------------------------------------------------- #
-# Jira ticket (child only)
+# Jira ticket (child only, per session)
 # --------------------------------------------------------------------------- #
 
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 
 
-def jira_key(cwd):
-    """Ticket pointer maintained by the model under the jira-context hook's
-    instructions. The literal `none` means the user explicitly works without
-    a ticket; garbage or a missing file mean the same to telemetry — the
-    caller sends jira.key as an explicit null (ATTR_NULL) in those cases."""
+def session_ticket_file(session_id):
+    """Per-session ticket file maintained by the model under the jira-context
+    hook's instructions: `<config>/afyapowers-core/sessions/<id>/jira-ticket`.
+    Location and sanitizing mirror hooks/jira-context (and statusline.py)."""
+    if not session_id:
+        return None
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    if not base or base.startswith("~"):
+        return None
+    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(session_id))
+    if not safe:
+        return None
+    return Path(base) / "afyapowers-core" / "sessions" / safe / "jira-ticket"
+
+
+def jira_key(session_id):
+    """Ticket confirmed by the user for THIS session. Deliberately no fallback
+    to the project pointer `.afyapowers/current-jira-ticket`: two sessions in
+    the same folder share that file, which is exactly the misattribution this
+    per-session file exists to avoid. The literal `none` means the user
+    explicitly works without a ticket; garbage or a missing file (including the
+    first prompt of a session, answered only after this hook has fired) mean
+    the same to telemetry — the caller sends jira.key as an explicit null
+    (ATTR_NULL) in those cases."""
+    path = session_ticket_file(session_id)
+    if path is None:
+        return None
     try:
-        raw = (Path(cwd) / ".afyapowers" / "current-jira-ticket").read_text(
-            encoding="utf-8"
-        ).strip()
+        raw = path.read_text(encoding="utf-8").strip()
     except Exception:
         return None
     if raw.lower() == "none":
@@ -646,7 +666,9 @@ def emit(config, payload):
         "session.id": payload.get("session_id") or ATTR_NULL,
         "prompt.id": payload.get("prompt_id") or ATTR_NULL,
         "hook.event": payload.get("hook_event_name") or ATTR_NULL,
-        "jira.key": jira_key(cwd) or ATTR_NULL,  # always present; explicit null when unset
+        # Always present; explicit null until the user confirms the ticket for
+        # this session (so the first record of every session is null).
+        "jira.key": jira_key(payload.get("session_id")) or ATTR_NULL,
         # Which plugin build produced this session — lets the backend correlate a
         # behavior change with the release that shipped it.
         "afyapowers.version": plugin_version() or ATTR_NULL,

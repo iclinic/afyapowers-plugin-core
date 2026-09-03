@@ -10,7 +10,7 @@ Funciona de forma independente do workflow de fases do [afyapowers](https://gith
 
 | Componente | Evento(s) | O que faz |
 |---|---|---|
-| [`hooks/jira-context`](#contexto-de-jira) | `UserPromptSubmit` | Confirma e injeta o ticket Jira atual como contexto de cada prompt |
+| [`hooks/jira-context`](#contexto-de-jira) | `SessionStart`, `UserPromptSubmit` | Confirma o ticket Jira **por sessão** e o injeta como contexto de cada prompt |
 | [`hooks/lang-directive`](#diretiva-de-idioma-pt-br) | `PreToolUse` (Skill), `UserPromptExpansion` | Reinjeta a diretiva de idioma pt-BR quando qualquer skill `afyapowers*:` é invocada |
 | [`hooks/render-history`](#histórico-de-conversas) | `SessionEnd` | Renderiza a conversa da sessão em HTML autocontido |
 | [`hooks/otel-context`](#telemetria-opentelemetry) | `SessionStart`, `UserPromptSubmit`, `SessionEnd` | Emite log records OTLP com contexto de git/Jira/versão |
@@ -24,21 +24,39 @@ Funciona de forma independente do workflow de fases do [afyapowers](https://gith
 Todos os hooks seguem o mesmo contrato:
 
 - **Nunca bloqueiam a sessão.** São observabilidade/enriquecimento de contexto: qualquer erro resulta em `exit 0` silencioso, nunca em prompt travado ou sessão quebrada.
-- **Nunca criam `.afyapowers/`.** A presença desse diretório é o que marca um projeto como afyapowers-enabled, e sua criação é responsabilidade do plugin afyapowers (`/afyapowers:new`). Em projetos sem `.afyapowers/`, os hooks degradam graciosamente: sem fluxo de ticket persistido, history vai para o diretório global e a telemetria emite `jira.key: null`.
+- **Nunca criam `.afyapowers/`.** A presença desse diretório é o que marca um projeto como afyapowers-enabled, e sua criação é responsabilidade do plugin afyapowers (`/afyapowers:new`). Em projetos sem `.afyapowers/`, os hooks degradam graciosamente: history vai para o diretório global. O estado **por sessão** (ticket Jira confirmado) fica fora do projeto, em `~/.claude/afyapowers-core/sessions/`, e não depende de `.afyapowers/` existir.
 - **Trabalho pesado fora do caminho crítico.** O que envolve git ou rede (telemetria) roda em processo filho destacado; o hook em si retorna em milissegundos.
 
 ## Componentes
 
 ### Contexto de Jira
 
-`hooks/jira-context` (`UserPromptSubmit`) é o dono do fluxo de ticket Jira. A cada prompt, dentro de um repositório git, ele:
+`hooks/jira-context` é o dono do fluxo de ticket Jira. O ticket é **por sessão**, não por projeto: duas sessões do Claude Code abertas na mesma pasta são dois trabalhos distintos, e cada uma grava a própria resposta em
 
-1. **Lê o ponteiro** `.afyapowers/current-jira-ticket` (uma linha: a chave do ticket, ex. `ABC-123`, ou o literal `none` para "sem ticket").
-2. **Extrai uma sugestão da branch** atual (padrão `ABC-123` no nome da branch).
-3. **Injeta uma instrução junto com o prompt do usuário** para que o modelo confirme o ticket como primeira ação do turno — uma vez por sessão, e novamente quando o assunto da conversa muda de tarefa. Ponteiro vazio, ausente ou em conflito com a branch vira pergunta ao usuário (via `AskUserQuestion`), com a chave da branch como opção recomendada.
-4. **Persiste a resposta** de volta no ponteiro, que alimenta a status line e a telemetria.
+```text
+~/.claude/afyapowers-core/sessions/<session_id>/
+  jira-ticket    # escrito pelo modelo: ABC-123 ou o literal none
+  branch-key     # escrito pelo hook: chave sugerida pela branch no último prompt
+```
 
-O hook também mantém o `.afyapowers/.gitignore` (quando o diretório existe), garantindo que ponteiro de ticket, marcador de feature ativa, history e logs de debug fiquem fora do versionamento. Fora de um repositório git ele não faz nada — um ticket só faz sentido atado a um projeto.
+(`~/.claude` respeita `CLAUDE_CONFIG_DIR`.) O arquivo `jira-ticket` é o que a telemetria e a status line leem — ambas o resolvem pelo `session_id` que já recebem no stdin.
+
+A cada `UserPromptSubmit`, dentro de um repositório git, o hook:
+
+1. **Lê o arquivo da sessão** e **extrai uma sugestão da branch** atual (padrão `ABC-123` no nome da branch).
+2. **Sessão sem resposta** → injeta, junto com o prompt, a instrução para o modelo perguntar ao usuário (via `AskUserQuestion`) como primeira ação do turno. Opção recomendada: a chave da branch, se houver; senão, "sem ticket". A instrução traz o caminho absoluto do arquivo da sessão a gravar.
+3. **Branch trocou no meio da sessão** (a chave sugerida mudou desde o último prompt e difere do ticket gravado) → pergunta de novo, uma vez por troca.
+4. **Sessão resolvida** → injeta só um lembrete curto com o ticket atual e a regra de perguntar de novo quando o prompt inicia outra tarefa/feature/bug.
+
+A deduplicação é por estado em disco, não pela memória do modelo: a pergunta se repete enquanto o arquivo da sessão não existir e nunca mais depois — sobrevive a `/compact`, e `--resume` reaproveita a resposta. O hook nunca grava o ticket por conta própria (não infere da branch): o usuário confirma uma vez por sessão.
+
+Não existe mais ponteiro por projeto: o antigo `.afyapowers/current-jira-ticket` era compartilhado por todas as sessões da pasta, exatamente o que fazia a resposta de uma sessão vazar para a telemetria da outra. Este plugin não o lê nem o grava.
+
+Em `SessionStart` o hook só faz manutenção: cria `sessions/` e remove entradas sem uso há mais de 7 dias (o arquivo da sessão é "tocado" a cada prompt, então uma sessão viva ou retomada nunca expira em uso). Não há registro em `SessionEnd`: `--resume` e `/clear` mantêm a sessão anterior retomável, e os hooks de `SessionEnd` de plugins dividem um orçamento total de 1,5 s.
+
+O hook não toca no projeto (nem `.afyapowers/` nem `.gitignore`). Fora de um repositório git ele não faz nada — um ticket só faz sentido atado a um projeto.
+
+> **Follow-up no afyapowers-dev:** a skill `design` ainda grava `.afyapowers/current-jira-ticket` (e `/new` o cria vazio), que nada mais lê. Para o ticket validado no design refletir na sessão corrente, ela deve passar a gravar o arquivo de sessão cujo caminho o `jira-context` informa no contexto de cada prompt.
 
 ### Diretiva de idioma pt-BR
 
@@ -65,7 +83,7 @@ Opt-in, instalada **globalmente** (vale para todos os projetos do usuário):
 /afyapowers-core:statusline
 ```
 
-Mostra no rodapé do Claude Code: a marca afyapowers, modelo e uso de contexto, o ticket Jira atual (resolvido por projeto a partir do diretório da sessão; omitido em projetos sem afyapowers), branch/estado do git, custo e duração da sessão.
+Mostra no rodapé do Claude Code: a marca afyapowers, modelo e uso de contexto, o ticket Jira confirmado **nesta sessão** (resolvido pelo `session_id`; omitido até o usuário confirmar ou quando trabalha sem ticket), branch/estado do git, custo e duração da sessão.
 
 Remoção: `/afyapowers-core:statusline remove`. O instalador é idempotente: mescla apenas a chave `statusLine` em `~/.claude/settings.json` e, na remoção, deleta apenas ela — nunca sobrescreve um settings quebrado.
 
@@ -92,7 +110,9 @@ O hook `otel-context` resolve isso emitindo **log records OTLP próprios** para 
 | `prompt.id` | `550e8400-…` | join exato por prompt; ausente no `SessionStart` |
 | `hook.event` | `UserPromptSubmit` | qual evento originou o record |
 | `afyapowers.version` | `1.0.0` | versão do plugin afyapowers-core que produziu o record; lida do manifesto instalado (fallback: `claude plugin details afyapowers-core`), `null` se indeterminável |
-| `jira.key` | `ABC-123` | ticket atual (`.afyapowers/current-jira-ticket`); sempre presente, `null` quando não há ticket |
+| `jira.key` | `ABC-123` | ticket confirmado **nesta sessão** (`~/.claude/afyapowers-core/sessions/<session_id>/jira-ticket`); sempre presente, `null` até o usuário confirmar ou quando trabalha sem ticket. Sem fallback para o ponteiro do projeto: sessões simultâneas na mesma pasta não se contaminam |
+| `afyapowers_dev.current_phase` | `implement` | fase atual da feature ativa do afyapowers-dev (`.afyapowers/features/<slug>/state.yaml`); omitido quando não há feature ativa |
+| `<plugin>.version` | `afyapowers_dev.version = 1.8.0` | versão de cada plugin da família afyapowers instalado (`claude plugin list --json`); omitido quando indisponível |
 | `git.branch` | `feat/tela-de-quizzes` | `detached` quando em detached HEAD |
 | `git.repo` | `iclinic/afyapowers` | slug do remote (`origin`, ou o primeiro remote); cai para o nome da pasta local se não houver remote hospedado |
 | `git.commit` | `73f5798` | SHA curto do `HEAD` |
@@ -109,6 +129,16 @@ records também, então filtram igual aos eventos nativos.
 **Como correlacionar:** no backend, junte nossos records aos nativos por `prompt.id` (exato) ou por
 `session.id` (sessão inteira). Ex.: custo de tokens por branch = `claude_code.token.usage` ⨝
 `event.name = 'afyapowers-core.git_context'` em `prompt.id`.
+
+**`jira.key` no primeiro record:** o hook dispara junto com o prompt, antes de o modelo perguntar e o
+usuário responder, então o record de `SessionStart` e o do primeiro `UserPromptSubmit` de cada sessão
+saem com `jira.key: null` por construção. Para atribuir a sessão inteira ao ticket, preencha no
+backend com o último valor não nulo da sessão, ex. (SQL/Databricks):
+
+```sql
+last_value(jira.key, true) over (partition by session.id order by time_unix_nano
+                                 rows between unbounded preceding and unbounded following)
+```
 
 ### Configuração
 
@@ -130,6 +160,12 @@ então funciona independente de env var de settings ser herdada por subprocesso.
 > **Migração do afyapowers ≤ 1.x:** as variáveis mudaram de prefixo (`AFYAPOWERS_OTEL_*` →
 > `AFYAPOWERS_CORE_OTEL_*`) e o `event.name` mudou de `afyapowers.git_context` para
 > `afyapowers-core.git_context`. Atualize managed settings e queries do backend.
+>
+> **Migração 1.1 → 1.2:** `jira.key` manteve nome e formato, mas a semântica mudou: passou a ser o
+> ticket confirmado **na sessão** (antes: `.afyapowers/current-jira-ticket`, compartilhado por todas
+> as sessões da pasta, que este plugin não lê mais) e é `null` até a confirmação, inclusive no
+> primeiro `UserPromptSubmit`. Queries que agregam por ticket devem usar o preenchimento por sessão
+> descrito acima.
 
 Ordem de resolução do endpoint: `AFYAPOWERS_CORE_OTEL_ENDPOINT` → `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` →
 `OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/logs`. Headers e protocolo seguem a mesma lógica per-signal do
@@ -171,7 +207,7 @@ sai `0` em qualquer erro.
 hooks/
   hooks.json                 # Registro dos hooks
   refresh-plugin-root        # Ponteiro da status line + aviso de Python (SessionStart)
-  jira-context               # Contexto de ticket Jira (UserPromptSubmit)
+  jira-context               # Ticket Jira por sessão (SessionStart/UserPromptSubmit)
   lang-directive             # Diretiva de idioma pt-BR (PreToolUse/UserPromptExpansion)
   render-history             # Histórico da conversa em HTML (SessionEnd)
   otel-context               # Telemetria OTLP (SessionStart/UserPromptSubmit/SessionEnd)

@@ -1,154 +1,338 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""afyapowers-core Jira ticket context (UserPromptSubmit + SessionStart).
 
-# UserPromptSubmit: the single owner of the Jira ticket flow.
-#
-# Context injected at SessionStart arrives before the first prompt and the
-# model routinely ignores it when it starts acting (same lesson that moved
-# lang-directive to per-skill injection), so everything happens here, injected
-# WITH the user's prompt — the moment the model is deciding what to do.
-#
-# Every message carries the same two instructions, whatever the pointer says,
-# and both are framed as the FIRST action of the turn — not something done
-# after the work starts. Once the model has read a file or invoked a skill it
-# is already committed to the request, and the question either never comes or
-# arrives too late to tag the work:
-#
-#   1. Confirm at the start of the session. A ticket left over from a previous
-#      session says nothing about what the user is doing now, so the ticket has
-#      to be confirmed once per session before the request is handled: still
-#      this one, another one, or no ticket at all. An unset pointer —
-#      `/afyapowers:new` bootstraps the file EMPTY — is the same state, nobody
-#      has been asked yet.
-#
-#   2. Re-confirm on a topic shift. A confirmation covers only the work it was
-#      given for, never a new piece of work later in the same session — so a
-#      prompt that changes the subject re-opens the question, again first.
-#
-# Both are deduped by instruction, not by state on disk: the messages say
-# "unless you already asked in this session" and scope the re-ask per topic
-# shift, and the model's own conversation memory does the bookkeeping. The hook
-# stays stateless — it reads the pointer and the branch, and nothing else.
-#
-# Every answer must be written to `.afyapowers/current-jira-ticket`: it is what
-# otel-context stamps on telemetry and what the statusline renders.
+The single owner of the Jira ticket flow. Context injected at SessionStart
+arrives before the first prompt and the model routinely ignores it when it
+starts acting (same lesson that moved lang-directive to per-skill injection),
+so the question is injected WITH the user's prompt — the moment the model is
+deciding what to do — and framed as the FIRST action of the turn. Once the
+model has read a file or invoked a skill it is already committed to the
+request, and the question either never comes or arrives too late to tag the
+work.
 
-json_escape() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  s="${s//$'\n'/\\n}"
-  s="${s//$'\r'/\\r}"
-  s="${s//$'\t'/\\t}"
-  printf '%s' "$s"
-}
+State is PER SESSION, not per project. Two Claude Code sessions open in the
+same folder are two different pieces of work, so each one records its own
+answer under the user's Claude config dir:
 
-AFYA_DIR=".afyapowers"
-JIRA_FILE="$AFYA_DIR/current-jira-ticket"
-WRITE_RULES="Persist the answer to .afyapowers/current-jira-ticket (create the directory first if needed): the chosen key uppercase, single line, no trailing newline (e.g. ABC-123), or the literal none so the user is not asked again. If you had to create .afyapowers/, also write .afyapowers/.gitignore with one line each: features/active, history/, otel-debug.jsonl, current-jira-ticket."
-# The tail every resolved-pointer message shares: a confirmation is scoped to
-# the work it was given for.
-SHIFT_RULES="After that, assess every prompt: the moment one starts a different piece of work — another task, feature or bug — asking again is once more the FIRST thing you do in that turn, before acting on it, even though the ticket was already confirmed in this session; a confirmation covers only the work it was given for, never a new topic shift. Tangents, follow-ups, questions and sub-tasks of the same work do not count as a shift."
+    <config>/afyapowers-core/sessions/<session_id>/
+      jira-ticket   written by the model: `ABC-123` or the literal `none`
+      branch-key    written by this hook: the ticket key extracted from the
+                    git branch at the last prompt (empty when none)
 
-# `/afyapowers:new` writes `.afyapowers/.gitignore`, but the ticket pointer is
-# created outside that flow too — the instructions above tell the model to write
-# it in any project, and `/new` may never run there. So top the file up on every
-# prompt: cheap, idempotent, and it keeps the local pointer, the active-feature
-# marker and the conversation logs out of version control. Never create
-# `.afyapowers/` itself — its presence is what marks a project as
-# afyapowers-enabled (same rule as render-history).
-ensure_gitignore() {
-  local gi="$AFYA_DIR/.gitignore" line trimmed existing="" missing="" found
-  if [ ! -d "$AFYA_DIR" ]; then
-    return 0
-  fi
-  if [ -f "$gi" ]; then
-    existing=$(cat "$gi" 2>/dev/null || true)
-  fi
-  for line in features/active history/ otel-debug.jsonl current-jira-ticket; do
-    found=""
-    while IFS= read -r trimmed; do
-      trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
-      trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
-      if [ "$trimmed" = "$line" ]; then
-        found=1
-        break
-      fi
-    done <<< "$existing"
-    if [ -z "$found" ]; then
-      missing="${missing}${line}"$'\n'
-    fi
-  done
-  if [ -z "$missing" ]; then
-    return 0
-  fi
-  # `$(...)` strips a trailing newline, so an empty capture means the file
-  # already ends with one.
-  if [ -s "$gi" ] && [ -n "$(tail -c1 "$gi" 2>/dev/null || true)" ]; then
-    printf '\n' >> "$gi" 2>/dev/null || true
-  fi
-  printf '%s' "$missing" >> "$gi" 2>/dev/null || true
-}
+`jira-ticket` is what otel-context stamps on telemetry and what the status
+line renders — both resolve it by the session id they already receive. There
+is no project-level pointer anymore: a file shared by every session in the
+folder is exactly what let one session's answer leak into another's telemetry.
 
-# Only run inside a git work tree. WRITE_RULES instructs the model to CREATE
-# `.afyapowers/` wherever it is, so injecting it in an arbitrary directory
-# (home, Downloads, a scratch folder) would scatter `.afyapowers/` across the
-# user's filesystem. A ticket only makes sense attached to a project anyway.
-if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]; then
-  exit 0
-fi
+Dedup is by state on disk, not by the model's memory:
 
-ensure_gitignore
+  1. Ask once per session. No session file -> the question goes out with the
+     prompt (branch key as the recommended option when the branch has one),
+     and the model is told the exact path to persist the answer to. As long
+     as the file is missing the question repeats; once written it never comes
+     back for this session — survives `/compact`, and `--resume` inside the
+     prune window does not re-ask.
 
-# Empty in detached HEAD. Every grep pipeline needs `|| true`: under pipefail
-# a no-match grep kills the hook.
-BRANCH=$(git branch --show-current 2>/dev/null || true)
-BRANCH_KEY=$(printf '%s' "$BRANCH" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+  2. Re-ask once per branch switch. `branch-key` remembers what the branch
+     suggested last time; the conflict question fires only when that changed
+     AND differs from the recorded ticket, so "keep ABC-1 although the branch
+     says ABC-2" is honoured until the branch actually changes again.
 
-# File value: strip newlines like features/active; discard garbage (keep `none`).
-# An empty file — the bootstrap default — falls through as unresolved, so the
-# user is asked; only the literal `none` records "the user has no ticket".
-FILE_KEY=""
-if [ -f "$JIRA_FILE" ]; then
-  FILE_KEY=$(tr -d '\n\r' < "$JIRA_FILE")
-  if [ "$FILE_KEY" != "none" ] && ! printf '%s' "$FILE_KEY" | grep -qE '^[A-Z][A-Z0-9]+-[0-9]+$'; then
-    FILE_KEY=""
-  fi
-fi
+  3. Re-ask on a topic shift. A confirmation covers only the work it was
+     given for; the short per-prompt context reminds the model to ask again
+     when a prompt starts a different task. This one stays instruction-based —
+     only the model can tell the subject changed.
 
-# The question is the first action of the turn, not a step in the work: it has
-# to land before anything commits the model to the request.
-PRIORITY="TOP PRIORITY — handle this before anything else in this turn."
-ASK="Unless you already asked in this session, ask the user NOW — use the AskUserQuestion tool when available —"
-BLOCK_RULES="Ask before you do anything else: no other tool call, no reading or searching files, no skill invocation, no plan or todo list, and no answer to any part of the request until the user has answered. Do not start the work and ask afterwards."
+Never touches the project: all state lives under the Claude config dir, so
+`.afyapowers/` is neither created nor required (its presence marks a project
+as afyapowers-enabled — owned by afyapowers-dev). Never blocks: any error ->
+exit 0, and nothing but the expected JSON is ever written to stdout (on
+UserPromptSubmit it is injected as context).
 
-MSG=""
-if [ -z "$FILE_KEY" ]; then
-  # Unset: ask before handling the request.
-  if [ -n "$BRANCH_KEY" ]; then
-    MSG="${PRIORITY} The Jira ticket for this project is not set. ${ASK} which Jira ticket this work belongs to. Options: '${BRANCH_KEY} (from branch) (Recommended)', 'Another ticket id' (the user types it), 'No specific task'. ${BLOCK_RULES} ${WRITE_RULES}"
-  else
-    MSG="${PRIORITY} The Jira ticket for this project is not set. ${ASK} whether this work is tied to a Jira ticket. Options: 'No specific task (Recommended if unsure)', 'Yes, a specific ticket' (the user types the id, e.g. ABC-123). ${BLOCK_RULES} ${WRITE_RULES}"
-  fi
-elif [ -n "$BRANCH_KEY" ] && [ "$BRANCH_KEY" != "$FILE_KEY" ]; then
-  # Conflict: the branch suggests a key the user has not confirmed.
-  if [ "$FILE_KEY" = "none" ]; then
-    RECORDED="the pointer records no specific task"
-    CURRENT_OPT="'No specific task (current setting)', 'Another ticket id' (the user types it)"
-  else
-    RECORDED="the recorded ticket is ${FILE_KEY}"
-    CURRENT_OPT="'Keep ${FILE_KEY} (current setting)', 'Another ticket id' (the user types it), 'No specific task'"
-  fi
-  MSG="${PRIORITY} The Jira ticket pointer conflicts with the git branch: ${RECORDED}, but the branch suggests ${BRANCH_KEY}. ${ASK} which applies. Options: '${BRANCH_KEY} (from branch) (Recommended)', ${CURRENT_OPT}. ${BLOCK_RULES} ${WRITE_RULES}"
-elif [ "$FILE_KEY" = "none" ]; then
-  # Resolved as no-task, but set in some earlier session: confirm once here,
-  # then watch for the start of new work.
-  MSG="${PRIORITY} Jira ticket: none (recorded as working without a ticket, possibly in an earlier session). ${ASK} whether they are working on a Jira ticket now. Options: 'Still no specific task (Recommended)', 'Yes, a specific ticket' (the user types the id, e.g. ABC-123). ${BLOCK_RULES} ${SHIFT_RULES} ${WRITE_RULES}"
-else
-  # Resolved with a key, possibly left over from an earlier session: confirm
-  # once here, then watch for a task switch.
-  MSG="${PRIORITY} Jira ticket: ${FILE_KEY} (recorded for this project, possibly in an earlier session). ${ASK} whether they are still working on ${FILE_KEY}. Options: 'Keep ${FILE_KEY} (Recommended)', 'Another ticket id' (the user types it), 'No specific task'. ${BLOCK_RULES} ${SHIFT_RULES} ${WRITE_RULES}"
-fi
+SessionStart is housekeeping only: create `sessions/` and prune entries unused
+for more than 7 days (the session file is touched on every prompt, so a live or
+recently resumed session never expires while in use).
+"""
 
-echo "{\"hookSpecificOutput\": {\"hookEventName\": \"UserPromptSubmit\", \"additionalContext\": \"$(json_escape "$MSG")\"}}"
-exit 0
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+BRANCH_KEY_RE = re.compile(r"[A-Z][A-Z0-9]+-[0-9]+")
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+GIT_TIMEOUT = 2
+PRUNE_AGE_S = 7 * 24 * 3600
+PRUNE_CAP = 1000
+SESSION_FILE = "jira-ticket"
+BRANCH_FILE = "branch-key"
+OWNED_FILES = (SESSION_FILE, BRANCH_FILE)
+
+
+# --------------------------------------------------------------------------- #
+# Session state location (mirrored in otel-context and scripts/statusline.py)
+# --------------------------------------------------------------------------- #
+
+def config_dir():
+    """`${CLAUDE_CONFIG_DIR:-~/.claude}`; None when HOME cannot be resolved
+    (expanduser then returns the literal `~`, which would otherwise create a
+    `~` directory relative to cwd)."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    if not base or base.startswith("~"):
+        return None
+    return Path(base)
+
+
+def sessions_root():
+    base = config_dir()
+    return base / "afyapowers-core" / "sessions" if base else None
+
+
+def sanitize(session_id):
+    return "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(session_id))
+
+
+def session_dir(session_id):
+    root = sessions_root()
+    if root is None or not session_id:
+        return None
+    safe = sanitize(session_id)
+    return root / safe if safe else None
+
+
+def read_key(path):
+    """One-line ticket file -> None (missing, empty or garbage: nobody has
+    answered), the literal `none` (explicitly no ticket) or a validated key."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    if raw.lower() == "none":
+        return "none"
+    raw = raw.upper()
+    return raw if JIRA_KEY_RE.match(raw) else None
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def write_text(path, text):
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Git
+# --------------------------------------------------------------------------- #
+
+def git(cwd, *args):
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, *args],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT,
+        )
+    except Exception:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def branch_key(cwd):
+    """First `ABC-123`-shaped token in the branch name; empty when the branch
+    has none or HEAD is detached."""
+    match = BRANCH_KEY_RE.search(git(cwd, "branch", "--show-current") or "")
+    return match.group(0) if match else ""
+
+
+# --------------------------------------------------------------------------- #
+# SessionStart: housekeeping
+# --------------------------------------------------------------------------- #
+
+def prune(root):
+    """Remove session dirs whose owned files were all last touched more than
+    PRUNE_AGE_S ago. Only names we could have created, never symlinks, only
+    our two files; rmdir fails harmlessly if anything else is inside."""
+    now = time.time()
+    try:
+        entries = list(os.scandir(root))[:PRUNE_CAP]
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            if not SAFE_NAME_RE.match(entry.name):
+                continue
+            newest = 0.0
+            for name in OWNED_FILES:
+                try:
+                    newest = max(newest, os.lstat(os.path.join(entry.path, name)).st_mtime)
+                except OSError:
+                    pass
+            if newest and now - newest < PRUNE_AGE_S:
+                continue
+            for name in OWNED_FILES:
+                try:
+                    os.unlink(os.path.join(entry.path, name))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(entry.path)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+
+def run_session_start():
+    root = sessions_root()
+    if root is not None:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        prune(root)
+    print("{}")
+
+
+# --------------------------------------------------------------------------- #
+# UserPromptSubmit: the question / the reminder
+# --------------------------------------------------------------------------- #
+
+PRIORITY = "TOP PRIORITY — handle this before anything else in this turn."
+ASK = "Ask the user NOW — use the AskUserQuestion tool when available —"
+BLOCK_RULES = (
+    "Ask before you do anything else: no other tool call, no reading or searching "
+    "files, no skill invocation, no plan or todo list, and no answer to any part of "
+    "the request until the user has answered. Do not start the work and ask afterwards."
+)
+
+
+def write_rules(session_file):
+    return (
+        "Persist the answer to the session file {} — create its parent directories "
+        "if needed — as exactly one line with no trailing newline: the chosen key "
+        "uppercase (e.g. ABC-123), or the literal none. That file is what telemetry "
+        "and the status line read for THIS session, and what stops this question "
+        "from being asked again."
+    ).format(json.dumps(str(session_file)))
+
+
+def describe(key):
+    return "none (working without a ticket)" if key == "none" else key
+
+
+def ask_unset(bkey, session_file):
+    """Nobody has answered in this session: ask, recommending the branch key
+    when there is one, else no ticket."""
+    options = []
+    if bkey:
+        options.append("'{} (from branch) (Recommended)'".format(bkey))
+    options.append("'Another ticket id' (the user types it, e.g. ABC-123)")
+    options.append("'No specific task'" if bkey else "'No specific task (Recommended if unsure)'")
+    return "{} The Jira ticket for this session is not set. {} which Jira ticket this work belongs to. Options: {}. {} {}".format(
+        PRIORITY, ASK, ", ".join(options), BLOCK_RULES, write_rules(session_file)
+    )
+
+
+def ask_branch_switch(bkey, session_key, session_file):
+    """The branch changed since the last prompt and suggests a different key."""
+    if session_key == "none":
+        recorded = "this session records no specific task"
+        current = "'No specific task (current setting)'"
+    else:
+        recorded = "this session records {}".format(session_key)
+        current = "'Keep {} (current setting)'".format(session_key)
+    return "{} The git branch changed: it now suggests {}, but {}. {} which applies. Options: '{} (from branch) (Recommended)', {}, 'Another ticket id' (the user types it). {} {}".format(
+        PRIORITY, bkey, recorded, ASK, bkey, current, BLOCK_RULES, write_rules(session_file)
+    )
+
+
+def remind(session_key, session_file):
+    """Resolved: a short reminder that keeps the topic-shift rule alive
+    (it has to survive compaction, and only the model can spot a shift)."""
+    return (
+        "Jira ticket for this session: {}. If this prompt starts a different piece of "
+        "work — another task, feature or bug — ask the user FIRST (AskUserQuestion) "
+        "which ticket it belongs to, before acting on it, and update the session file "
+        "{} with the answer (one line, uppercase key or none, no trailing newline). "
+        "Tangents, follow-ups, questions and sub-tasks of the same work do not count "
+        "as a shift."
+    ).format(describe(session_key), json.dumps(str(session_file)))
+
+
+def run_prompt(payload):
+    session_id = payload.get("session_id")
+    cwd = payload.get("cwd") or os.getcwd()
+    if not session_id:
+        return  # without a session there is nothing to attach the ticket to
+    # Only inside a git work tree: a ticket only makes sense attached to a
+    # project, and asking about Jira in home/Downloads/scratch dirs is noise.
+    if git(cwd, "rev-parse", "--is-inside-work-tree") != "true":
+        return
+
+    sdir = session_dir(session_id)
+    if sdir is None:
+        return
+    session_file = sdir / SESSION_FILE
+    branch_file = sdir / BRANCH_FILE
+
+    session_key = read_key(session_file)
+    bkey = branch_key(cwd)
+    prev_bkey = read_text(branch_file)
+
+    if session_key is None:
+        msg = ask_unset(bkey, session_file)
+    elif bkey and bkey != session_key and bkey != prev_bkey:
+        msg = ask_branch_switch(bkey, session_key, session_file)
+    else:
+        msg = remind(session_key, session_file)
+
+    # Remember what the branch suggested (so the switch question fires once
+    # per switch) and keep the live session out of the prune window.
+    write_text(branch_file, bkey)
+    if session_key is not None:
+        try:
+            os.utime(session_file, None)
+        except OSError:
+            pass
+
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": msg,
+        }
+    }))
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        if payload.get("hook_event_name") == "SessionStart":
+            run_session_start()
+        else:
+            run_prompt(payload)
+    except Exception:
+        pass  # context enrichment must never break a session
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
