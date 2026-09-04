@@ -17,6 +17,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/jira-context",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [

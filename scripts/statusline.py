@@ -2,8 +2,8 @@
 """afyapowers-core status line for Claude Code.
 
 Reads the session JSON Claude Code pipes to stdin and prints up to three
-lines: brand / model / context usage, Jira ticket + git status,
-and session cost/duration. Installed into the user's
+lines: brand / model / context usage, Jira ticket (confirmed for this session,
+resolved by `session_id`) + git status, and session cost/duration. Installed into the user's
 `~/.claude/settings.json` by the `/afyapowers-core:statusline` skill,
 which resolves this script through the `~/.claude/afyapowers-core/plugin-root`
 pointer maintained by the refresh-plugin-root hook (the install path
@@ -77,11 +77,29 @@ def seg_context(data):
     return "%s\U0001f9e0 %d%%%s" % (color, pct, RESET)
 
 
-def seg_jira(cwd):
+def session_ticket_file(session_id):
+    """Per-session ticket file maintained by the model under the jira-context
+    hook's instructions: `<config>/afyapowers-core/sessions/<id>/jira-ticket`.
+    Location and sanitizing mirror hooks/jira-context and hooks/otel-context."""
+    if not session_id:
+        return None
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    if not base or base.startswith("~"):
+        return None
+    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(session_id))
+    if not safe:
+        return None
+    return Path(base) / "afyapowers-core" / "sessions" / safe / "jira-ticket"
+
+
+def seg_jira(session_id):
+    # Per session, not per project: two sessions in the same folder can be on
+    # different tickets. No fallback to `.afyapowers/current-jira-ticket`.
+    path = session_ticket_file(session_id)
+    if path is None:
+        return None
     try:
-        raw = (Path(cwd) / ".afyapowers" / "current-jira-ticket").read_text(
-            encoding="utf-8"
-        ).strip()
+        raw = path.read_text(encoding="utf-8").strip()
     except Exception:
         return None
     if raw.lower() == "none":
@@ -163,7 +181,7 @@ def main():
 
     lines = [
         [_safe(seg_brand), _safe(seg_model, data), _safe(seg_context, data)],
-        [_safe(seg_jira, cwd), _safe(seg_git, cwd)],
+        [_safe(seg_jira, data.get("session_id")), _safe(seg_git, cwd)],
         [_safe(seg_cost, data), _safe(seg_duration, data)],
     ]
     for segments in lines:

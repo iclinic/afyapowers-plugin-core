@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 You are installing (or removing) the afyapowers custom status line for the current user. It is installed **globally** in `~/.claude/settings.json` and applies to every project on this machine. Follow these steps exactly.
 
-The status line shows, at the bottom of Claude Code: the afyapowers brand, model and context usage; the current Jira ticket — resolved per-project from the session's working directory, and simply omitted in projects without afyapowers; git branch/status, session cost and duration.
+The status line shows, at the bottom of Claude Code: the afyapowers brand, model and context usage; the Jira ticket confirmed for the current session — resolved per-session by `session_id` from `~/.claude/afyapowers-core/sessions/`, and simply omitted until the user confirms one (or when working without a ticket); git branch/status, session cost and duration.
 
 ## Step 0: Preconditions
 
@@ -47,7 +47,7 @@ Confirm the output is `ok=true`. If it is `ok=false` or the command errors, repo
 After a successful **install**, tell the user:
 - A status line foi instalada globalmente para o seu usuário em `~/.claude/settings.json` e vale para todos os projetos; aparece na próxima interação (ou nova sessão).
 - Ela é atualizada automaticamente quando o plugin for atualizado (o hook `refresh-plugin-root` regrava o ponteiro `~/.claude/afyapowers-core/plugin-root` a cada início de sessão).
-- Em projetos sem afyapowers, o segmento de Jira simplesmente não aparece.
+- O segmento de Jira mostra o ticket confirmado na sessão atual; até a confirmação (ou quando se trabalha sem ticket) ele simplesmente não aparece.
 - Para removê-la: `/afyapowers-core:statusline remove`.
 
 After a successful **remove**, tell the user the status line entry was removed from `~/.claude/settings.json` and the default footer returns on the next interaction.
