@@ -145,16 +145,21 @@ def resolve_config(payload):
     """Build the emitter config, or return (None, reason) when telemetry is
     unroutable (no endpoint, or a protocol we cannot speak).
 
-    Resolution reads a single merged map built in three tiers, later winning:
-    user/project settings `env` < process environment < managed settings `env`
-    (on-disk managed + drop-ins + cached server-managed, see `settings_env`).
-    That mirrors Claude Code itself, where managed settings override any
-    conflicting variable the developer exported, so nothing a user does in a
-    shell or a dotfile can redirect the organization's telemetry. OTel's own
-    precedence is then applied over that map, which means a per-signal variable
-    beats a generic one no matter which tier it came from (a settings-file
-    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT does beat an exported
-    OTEL_EXPORTER_OTLP_ENDPOINT), matching the native exporter's behavior.
+    The routing keys — endpoint, protocol and headers — are resolved per tier
+    and then across tiers, managed settings winning: for each key the highest
+    tier that sets it (managed `env` > process environment > user/project `env`,
+    see `settings_env`) decides, and OTel's per-signal alias beats the generic
+    one *within* that tier. Managed settings thus lock the destination the
+    organization chose; nothing a user exports in a shell or writes in a dotfile
+    — not even through the per-signal OTEL_EXPORTER_OTLP_LOGS_ENDPOINT alias —
+    can redirect the telemetry, because a lower tier is never consulted once a
+    higher one has set the route. (Resolving on a single merged map instead
+    would leak exactly that redirect: the per-signal and generic aliases are
+    distinct keys, so a lower tier's per-signal one would survive the merge and
+    then win OTel precedence over a higher tier's generic one.)
+
+    Non-routing reads — the organization's static resource attributes and our
+    own boolean flags — still come from a merged map where managed wins per key.
 
     There is deliberately no plugin-specific override of the endpoint, headers
     or protocol: the destination belongs to the organization and comes from its
@@ -162,9 +167,27 @@ def resolve_config(payload):
     """
     cwd = payload.get("cwd") or os.getcwd()
     user_env, managed_env = settings_env(cwd)
+    process_env = {k: v for k, v in os.environ.items() if v}
+    # Highest priority first. Routing keys are read tier by tier off this order,
+    # never off a flattened map, so a lower tier cannot reroute a higher one.
+    tiers = (managed_env, process_env, user_env)
+
+    def signal(specific, generic, transform=None):
+        """First tier that sets either alias decides; within it the per-signal
+        value wins, else the generic one (through `transform`)."""
+        for tier in tiers:
+            value = tier.get(specific) or None
+            if value:
+                return value
+            base = tier.get(generic) or None
+            if base:
+                return transform(base) if transform else base
+        return None
+
+    # The merged map (managed wins per key) backs only the non-routing reads.
     env = dict(user_env)
-    env.update({k: v for k, v in os.environ.items() if v})
-    env.update(managed_env)  # managed always wins, as in Claude Code itself
+    env.update(process_env)
+    env.update(managed_env)
 
     def get(name):
         return env.get(name) or None
@@ -172,25 +195,33 @@ def resolve_config(payload):
     # No opt-in and no kill switch: the hook always emits when it has somewhere
     # to send to. The only reasons to stay silent are missing routing data (no
     # endpoint) or a transport we cannot speak (grpc).
-    endpoint = get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
-    if not endpoint:
-        base = get("OTEL_EXPORTER_OTLP_ENDPOINT")
-        if base:
-            endpoint = base.rstrip("/") + "/v1/logs"
+    endpoint = signal(
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        transform=lambda base: base.rstrip("/") + "/v1/logs",
+    )
     if not endpoint:
         return None, "no OTLP logs endpoint configured"
 
     protocol = (
-        get("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
-        or get("OTEL_EXPORTER_OTLP_PROTOCOL")
+        signal("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "OTEL_EXPORTER_OTLP_PROTOCOL")
         or DEFAULT_PROTOCOL
     )
     if protocol == "grpc":
         # We only speak OTLP over HTTP; the org's logs route must be http/*.
         return None, "grpc protocol unsupported; configure an http/protobuf or http/json logs endpoint"
 
-    headers = parse_kv(get("OTEL_EXPORTER_OTLP_HEADERS"))
-    headers.update(parse_kv(get("OTEL_EXPORTER_OTLP_LOGS_HEADERS")))
+    # Headers come whole from the same winning tier as the rest of the route, so
+    # a lower tier cannot pin auth headers onto a managed endpoint. Within that
+    # tier the per-signal headers merge over the generic ones.
+    headers = {}
+    for tier in tiers:
+        generic = tier.get("OTEL_EXPORTER_OTLP_HEADERS") or None
+        specific = tier.get("OTEL_EXPORTER_OTLP_LOGS_HEADERS") or None
+        if generic or specific:
+            headers = parse_kv(generic)
+            headers.update(parse_kv(specific))
+            break
     # The inherited headers may pin a content-type for the native exporter's
     # encoding; ours is decided by `protocol`, so drop any inherited copy.
     headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}

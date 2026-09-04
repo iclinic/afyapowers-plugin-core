@@ -54,6 +54,7 @@ for more than 7 days (the session file is touched on every prompt, so a live or
 recently resumed session never expires while in use).
 """
 
+import itertools
 import json
 import os
 import re
@@ -171,7 +172,8 @@ def prune(root):
     our two files; rmdir fails harmlessly if anything else is inside."""
     now = time.time()
     try:
-        entries = list(os.scandir(root))[:PRUNE_CAP]
+        with os.scandir(root) as it:
+            entries = list(itertools.islice(it, PRUNE_CAP))
     except OSError:
         return
     for entry in entries:
