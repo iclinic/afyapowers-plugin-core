@@ -34,6 +34,7 @@ Set AFYAPOWERS_CORE_OTEL_DEBUG=1 to trace what was sent (or why it wasn't) into
 import json
 import os
 import re
+import socket
 import struct
 import subprocess
 import sys
@@ -443,6 +444,43 @@ def feature_phase(cwd):
 
 
 # --------------------------------------------------------------------------- #
+# Host and account identity (child only)
+# --------------------------------------------------------------------------- #
+
+def account_config_path():
+    """Path to Claude Code's main config file (`.claude.json`), which holds the
+    logged-in account. It lives at `$CLAUDE_CONFIG_DIR/.claude.json` when that
+    var is set, else `~/.claude.json`. Note it is a SIBLING of the `~/.claude`
+    config dir, not a file inside it, so this cannot reuse `config_dir()`."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (Path(base) if base else Path.home()) / ".claude.json"
+
+
+def account_email():
+    """Email of the Claude account logged in on this machine, from
+    `oauthAccount.emailAddress` in the main config — the same identity the native
+    claude_code.* events carry as user.email. None when logged out, on a host IDE
+    that stores auth elsewhere, or if the file is missing/unreadable, so the
+    attribute is omitted (optional, never an explicit null)."""
+    try:
+        data = json.loads(account_config_path().read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    account = data.get("oauthAccount") if isinstance(data, dict) else None
+    if not isinstance(account, dict):
+        return None
+    return account.get("emailAddress") or None
+
+
+def hostname():
+    """This machine's network hostname, or None if it cannot be determined."""
+    try:
+        return socket.gethostname() or None
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Git attributes (child only)
 # --------------------------------------------------------------------------- #
 
@@ -704,6 +742,15 @@ def emit(config, payload):
         "afyapowers.version": plugin_version() or ATTR_NULL,
         **git_attrs(cwd, config["git_dirty"]),
     }
+    # Optional host/account identity: user.email mirrors the native claude_code.*
+    # events, host.name follows OTel host semconv. Omitted (never null) when
+    # unresolvable — logged out, or a host IDE that stores auth elsewhere.
+    email = account_email()
+    if email:
+        attrs["user.email"] = email
+    host = hostname()
+    if host:
+        attrs["host.name"] = host
     # Optional workflow context: only present when an afyapowers-dev feature is
     # active and its state.yaml names a phase — never emitted as null.
     phase = feature_phase(cwd)
