@@ -142,18 +142,25 @@ last_value(jira.key, true) over (partition by session.id order by time_unix_nano
 
 ### Configuração
 
-O hook não tem config própria obrigatória: ele **herda** a configuração OTLP que você já usa. Se
-`CLAUDE_CODE_ENABLE_TELEMETRY=1` e houver um endpoint de logs resolvível, ele emite; caso contrário
-fica silenciosamente inerte. As env vars podem vir do ambiente ou do bloco `env` de qualquer
-`settings.json` (managed > projeto local > projeto > usuário) — o hook lê os arquivos como fallback,
-então funciona independente de env var de settings ser herdada por subprocesso.
+O hook não tem config própria obrigatória: ele **herda** a configuração OTLP que você já usa. Sempre
+que houver um endpoint de logs resolvível, ele emite — não existe opt-in nem kill switch por env var;
+ele só fica inerte quando faltam os dados para enviar (sem endpoint, ou protocolo `grpc`, que o hook
+não fala). As env vars podem vir do ambiente ou do bloco `env` de qualquer settings que o Claude
+Code carrega, na precedência dele: **remote managed** (`~/.claude/remote-settings.json`, cache das
+managed settings configuradas pelo admin no claude.ai) > managed em disco (`managed-settings.json` +
+drop-ins `managed-settings.d/*.json`) > **ambiente do processo** > projeto local > projeto > usuário.
+Ou seja, as managed settings vencem inclusive uma env var exportada no shell do dev, exatamente como
+o Claude Code faz no startup: nada que um usuário faça em dotfile ou shell redireciona a telemetria da
+organização. O hook lê esses arquivos diretamente porque o `env` das settings **não** é herdado pelo
+subprocesso do hook — numa frota configurada só por remote managed settings, o cache local é a única
+fonte do endpoint. (`~/.claude` respeita `CLAUDE_CONFIG_DIR`.)
+
+Não existe variável do plugin para trocar endpoint, headers ou protocolo: o destino é o da organização,
+definido nas managed settings, e nenhum usuário consegue redirecioná-lo. As únicas variáveis próprias
+são de diagnóstico:
 
 | Variável | Efeito |
 |---|---|
-| `AFYAPOWERS_CORE_OTEL_ENABLED` | `1` liga mesmo sem `CLAUDE_CODE_ENABLE_TELEMETRY`; `0` é kill switch e vence tudo |
-| `AFYAPOWERS_CORE_OTEL_ENDPOINT` | sobrescreve o endpoint de logs (necessário se a org usa `grpc`, já que o hook só fala OTLP sobre HTTP) |
-| `AFYAPOWERS_CORE_OTEL_HEADERS` | headers extras/sobrescritos, formato `k=v,k=v` |
-| `AFYAPOWERS_CORE_OTEL_PROTOCOL` | `http/protobuf` (default) ou `http/json` |
 | `AFYAPOWERS_CORE_OTEL_GIT_DIRTY` | `1` inclui `git.dirty`. Opt-in porque `git status` varre a árvore inteira e custa segundos em monorepo |
 | `AFYAPOWERS_CORE_OTEL_DEBUG` | `1` grava o que foi enviado (ou por que não) em `.afyapowers/otel-debug.jsonl` |
 
@@ -165,17 +172,29 @@ então funciona independente de env var de settings ser herdada por subprocesso.
 > ticket confirmado **na sessão** (antes: `.afyapowers/current-jira-ticket`, compartilhado por todas
 > as sessões da pasta, que este plugin não lê mais) e é `null` até a confirmação, inclusive no
 > primeiro `UserPromptSubmit`. Queries que agregam por ticket devem usar o preenchimento por sessão
-> descrito acima.
+> descrito acima. `AFYAPOWERS_CORE_OTEL_ENABLED` deixou de existir e `CLAUDE_CODE_ENABLE_TELEMETRY`
+> não é mais consultado: o hook emite sempre que houver endpoint configurado. `AFYAPOWERS_CORE_OTEL_ENDPOINT`,
+> `_HEADERS` e `_PROTOCOL` também foram removidas: o destino é sempre o das managed settings, sem
+> override por usuário (uma org que expõe logs só por `grpc` precisa publicar uma rota HTTP).
+>
+> **Correção 1.2:** o 1.1.x não lia `~/.claude/remote-settings.json`. Em orgs que distribuem a config
+> OTLP apenas por remote managed settings (sem `managed-settings.json` em disco), o hook não achava
+> endpoint e nenhum `git_context` era emitido — só quem tinha o bloco `env` copiado no próprio
+> `settings.json` aparecia no backend. Atualizar o plugin basta; nenhuma config precisa mudar.
 
-Ordem de resolução do endpoint: `AFYAPOWERS_CORE_OTEL_ENDPOINT` → `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` →
-`OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/logs`. Headers e protocolo seguem a mesma lógica per-signal do
+Ordem de resolução do endpoint: `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` → `OTEL_EXPORTER_OTLP_ENDPOINT` +
+`/v1/logs`. Headers e protocolo seguem a mesma lógica per-signal do
 OTel (`OTEL_EXPORTER_OTLP_LOGS_HEADERS` / `_PROTOCOL` ganham dos genéricos).
 
 ### Rollout na frota
 
-Um único arquivo de managed settings (`/Library/Application Support/ClaudeCode/managed-settings.json`
-no macOS, `/etc/claude-code/` no Linux) mais o plugin atualizado cobrem toda a base de devs — sem
-dotfile e sem setting por repositório:
+O bloco `env` abaixo nas **remote managed settings** (claude.ai → Admin Settings → Claude Code →
+Managed settings, planos Team/Enterprise) mais o plugin atualizado cobrem toda a base de devs — sem
+dotfile, sem setting por repositório e sem depender de role: as remote settings valem igual para todo
+usuário autenticado na org, e o Claude Code as cacheia em `~/.claude/remote-settings.json`, que o hook
+lê. A alternativa é o mesmo bloco num arquivo de managed settings em disco
+(`/Library/Application Support/ClaudeCode/managed-settings.json` no macOS, `/etc/claude-code/` no
+Linux), distribuído por MDM:
 
 ```json
 {
@@ -191,9 +210,9 @@ dotfile e sem setting por repositório:
 }
 ```
 
-> Managed settings **remove** env vars conflitantes definidas pelo dev no startup. Fixar
-> `OTEL_RESOURCE_ATTRIBUTES` ali é o que você quer para atributos organizacionais, mas inviabiliza
-> qualquer enriquecimento local via wrapper de shell.
+> Managed settings **remove** env vars conflitantes definidas pelo dev no startup, e o hook segue a
+> mesma regra ao montar sua config. Fixar `OTEL_RESOURCE_ATTRIBUTES` ali é o que você quer para
+> atributos organizacionais, mas inviabiliza qualquer enriquecimento local via wrapper de shell.
 
 **Garantias do hook:** roda no caminho crítico do prompt apenas para resolver config e fazer spawn de
 um filho destacado (~50 ms); git e rede acontecem no filho. Nunca escreve em stdout (em
