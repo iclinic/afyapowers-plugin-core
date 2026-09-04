@@ -63,7 +63,7 @@ import time
 from pathlib import Path
 
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
-BRANCH_KEY_RE = re.compile(r"[A-Z][A-Z0-9]+-[0-9]+")
+BRANCH_KEY_RE = re.compile(r"[A-Z][A-Z0-9]+-[0-9]+", re.IGNORECASE)
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 GIT_TIMEOUT = 2
 PRUNE_AGE_S = 7 * 24 * 3600
@@ -152,10 +152,13 @@ def git(cwd, *args):
 
 
 def branch_key(cwd):
-    """First `ABC-123`-shaped token in the branch name; empty when the branch
-    has none or HEAD is detached."""
+    """First `ABC-123`-shaped token in the branch name, normalized to upper
+    case; empty when the branch has none or HEAD is detached. The match is
+    case-insensitive because branches routinely carry the key in lower case
+    (`feature/abc-123-...`); the returned key is upper-cased to line up with
+    the recorded ticket, which `read_key` always stores upper-cased."""
     match = BRANCH_KEY_RE.search(git(cwd, "branch", "--show-current") or "")
-    return match.group(0) if match else ""
+    return match.group(0).upper() if match else ""
 
 
 # --------------------------------------------------------------------------- #
