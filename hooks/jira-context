@@ -27,8 +27,11 @@ folder is exactly what let one session's answer leak into another's telemetry.
 Dedup is by state on disk, not by the model's memory:
 
   1. Ask once per session. No session file -> the question goes out with the
-     prompt (branch key as the recommended option when the branch has one),
-     and the model is told the exact path to persist the answer to. As long
+     prompt, recommending the branch key when the branch has one and typing
+     the id otherwise ("no ticket" is always offered, never recommended: the
+     goal is to identify the ticket), and the model is told the exact path
+     to persist the answer to. Outside a git work tree there is no branch
+     to infer from, but the question is asked all the same. As long
      as the file is missing the question repeats; once written it never comes
      back for this session — survives `/compact`, and `--resume` inside the
      prune window does not re-ask.
@@ -243,12 +246,15 @@ def describe(key):
 
 def ask_unset(bkey, session_file):
     """Nobody has answered in this session: ask, recommending the branch key
-    when there is one, else no ticket."""
+    when there is one, else typing the id. "No specific task" is always
+    offered but never recommended."""
     options = []
     if bkey:
         options.append("'{} (from branch) (Recommended)'".format(bkey))
-    options.append("'Another ticket id' (the user types it, e.g. ABC-123)")
-    options.append("'No specific task'" if bkey else "'No specific task (Recommended if unsure)'")
+        options.append("'Another ticket id' (the user types it, e.g. ABC-123)")
+    else:
+        options.append("'Another ticket id (Recommended)' (the user types it, e.g. ABC-123)")
+    options.append("'No specific task'")
     return "{} The Jira ticket for this session is not set. {} which Jira ticket this work belongs to. Options: {}. {} {}".format(
         PRIORITY, ASK, ", ".join(options), BLOCK_RULES, write_rules(session_file)
     )
@@ -285,10 +291,8 @@ def run_prompt(payload):
     cwd = payload.get("cwd") or os.getcwd()
     if not session_id:
         return  # without a session there is nothing to attach the ticket to
-    # Only inside a git work tree: a ticket only makes sense attached to a
-    # project, and asking about Jira in home/Downloads/scratch dirs is noise.
-    if git(cwd, "rev-parse", "--is-inside-work-tree") != "true":
-        return
+    # Outside a git work tree `branch_key` is simply empty: the question is
+    # asked everywhere, only the branch inference needs a repo.
 
     sdir = session_dir(session_id)
     if sdir is None:

@@ -8,7 +8,7 @@ Funciona de forma independente do workflow de fases do [afyapowers](https://gith
 
 ## Visão geral
 
-| Componente | Evento(s) | O que faz |
+| Componente | Evento(s) | O que faz |  
 |---|---|---|
 | [`hooks/jira-context`](#contexto-de-jira) | `SessionStart`, `UserPromptSubmit` | Confirma o ticket Jira **por sessão** e o injeta como contexto de cada prompt |
 | [`hooks/lang-directive`](#diretiva-de-idioma-pt-br) | `PreToolUse` (Skill), `UserPromptExpansion` | Reinjeta a diretiva de idioma pt-BR quando qualquer skill `afyapowers*:` é invocada |
