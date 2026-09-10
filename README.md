@@ -8,9 +8,9 @@ Funciona de forma independente do workflow de fases do [afyapowers](https://gith
 
 ## Visão geral
 
-| Componente | Evento(s) | O que faz |
+| Componente | Evento(s) | O que faz |  
 |---|---|---|
-| [`hooks/jira-context`](#contexto-de-jira) | `SessionStart`, `UserPromptSubmit` | Confirma o ticket Jira **por sessão** e o injeta como contexto de cada prompt |
+| [`hooks/jira-context`](#contexto-de-jira) | `SessionStart`, `UserPromptSubmit`, `PostToolUse` (AskUserQuestion) | Confirma o ticket Jira **uma vez por sessão**, grava a resposta e o injeta como contexto de cada prompt |
 | [`hooks/lang-directive`](#diretiva-de-idioma-pt-br) | `PreToolUse` (Skill), `UserPromptExpansion` | Reinjeta a diretiva de idioma pt-BR quando qualquer skill `afyapowers*:` é invocada |
 | [`hooks/render-history`](#histórico-de-conversas) | `SessionEnd` | Renderiza a conversa da sessão em HTML autocontido |
 | [`hooks/otel-context`](#telemetria-opentelemetry) | `SessionStart`, `UserPromptSubmit`, `SessionEnd` | Emite log records OTLP com contexto de git/Jira/versão |
@@ -35,26 +35,26 @@ Todos os hooks seguem o mesmo contrato:
 
 ```text
 ~/.claude/afyapowers-core/sessions/<session_id>/
-  jira-ticket    # escrito pelo modelo: ABC-123 ou o literal none
-  branch-key     # escrito pelo hook: chave sugerida pela branch no último prompt
+  jira-ticket    # escrito pelo hook (PostToolUse) a partir da resposta do AskUserQuestion: ABC-123 ou o literal none
 ```
 
 (`~/.claude` respeita `CLAUDE_CONFIG_DIR`.) O arquivo `jira-ticket` é o que a telemetria e a status line leem — ambas o resolvem pelo `session_id` que já recebem no stdin.
 
-A cada `UserPromptSubmit`, dentro de um repositório git, o hook:
+A cada `UserPromptSubmit` o hook:
 
-1. **Lê o arquivo da sessão** e **extrai uma sugestão da branch** atual (padrão `ABC-123` no nome da branch).
-2. **Sessão sem resposta** → injeta, junto com o prompt, a instrução para o modelo perguntar ao usuário (via `AskUserQuestion`) como primeira ação do turno. Opção recomendada: a chave da branch, se houver; senão, "sem ticket". A instrução traz o caminho absoluto do arquivo da sessão a gravar.
-3. **Branch trocou no meio da sessão** (a chave sugerida mudou desde o último prompt e difere do ticket gravado) → pergunta de novo, uma vez por troca.
-4. **Sessão resolvida** → injeta só um lembrete curto com o ticket atual e a regra de perguntar de novo quando o prompt inicia outra tarefa/feature/bug.
+1. **Lê o arquivo da sessão.**
+2. **Sessão sem resposta** → extrai uma sugestão da branch atual (padrão `ABC-123` no nome da branch, quando há repositório git) e injeta, junto com o prompt, a instrução para o modelo perguntar ao usuário via `AskUserQuestion` como primeira ação do turno, com o header fixo `Jira ticket`. Opção recomendada: a chave da branch, se houver; senão, digitar o id. "Sem ticket" é sempre oferecido, nunca recomendado.
+3. **Sessão resolvida** → injeta só uma linha com o ticket atual e a instrução explícita de **não perguntar de novo** nesta sessão. Troca de branch ou mudança de assunto não re-perguntam: o ticket vale para a sessão inteira.
 
-A deduplicação é por estado em disco, não pela memória do modelo: a pergunta se repete enquanto o arquivo da sessão não existir e nunca mais depois — sobrevive a `/compact`, e `--resume` reaproveita a resposta. O hook nunca grava o ticket por conta própria (não infere da branch): o usuário confirma uma vez por sessão.
+Quem **grava a resposta é o próprio hook**, no evento `PostToolUse` de `AskUserQuestion`: ele reconhece a pergunta **exclusivamente pelo header `Jira ticket`** (qualquer outra pergunta do agente, mesmo que mencione Jira, é ignorada), lê a opção escolhida (ou o texto digitado) e escreve `jira-ticket` — chave `ABC-123` em maiúsculas ou `none` — **apenas se o arquivo da sessão ainda não existir**; uma resposta já gravada nunca é sobrescrita. Delegar a gravação ao modelo era a causa das perguntas repetidas: em plan mode o modelo não pode gravar arquivos, e fora dele às vezes ignorava a instrução. O modelo só grava o arquivo por conta própria quando `AskUserQuestion` não está disponível.
+
+A deduplicação é por estado em disco, não pela memória do modelo: a pergunta se repete enquanto o arquivo da sessão não existir (o usuário cancelou a pergunta ou o modelo a pulou) e nunca mais depois — sobrevive a `/compact` e a plan mode, e `--resume` reaproveita a resposta. O hook não infere o ticket da branch sozinho: o usuário confirma uma vez por sessão; uma sessão nova pergunta de novo.
 
 Não existe mais ponteiro por projeto: o antigo `.afyapowers/current-jira-ticket` era compartilhado por todas as sessões da pasta, exatamente o que fazia a resposta de uma sessão vazar para a telemetria da outra. Este plugin não o lê nem o grava.
 
 Em `SessionStart` o hook só faz manutenção: cria `sessions/` e remove entradas sem uso há mais de 7 dias (o arquivo da sessão é "tocado" a cada prompt, então uma sessão viva ou retomada nunca expira em uso). Não há registro em `SessionEnd`: `--resume` e `/clear` mantêm a sessão anterior retomável, e os hooks de `SessionEnd` de plugins dividem um orçamento total de 1,5 s.
 
-O hook não toca no projeto (nem `.afyapowers/` nem `.gitignore`). Fora de um repositório git ele não faz nada — um ticket só faz sentido atado a um projeto.
+O hook não toca no projeto (nem `.afyapowers/` nem `.gitignore`). Fora de um repositório git a pergunta é feita do mesmo jeito — só a sugestão a partir da branch precisa de um repositório.
 
 > **Follow-up no afyapowers-dev:** a skill `design` ainda grava `.afyapowers/current-jira-ticket` (e `/new` o cria vazio), que nada mais lê. Para o ticket validado no design refletir na sessão corrente, ela deve passar a gravar o arquivo de sessão cujo caminho o `jira-context` informa no contexto de cada prompt.
 
@@ -177,6 +177,13 @@ são de diagnóstico:
 > `_HEADERS` e `_PROTOCOL` também foram removidas: o destino é sempre o das managed settings, sem
 > override por usuário (uma org que expõe logs só por `grpc` precisa publicar uma rota HTTP).
 >
+> **Migração 1.2 → 1.3:** a pergunta do ticket passou a ser feita **uma única vez por sessão**, com a chave
+> da branch como opção recomendada quando existir. Não há mais re-pergunta por troca de branch nem por
+> mudança de assunto, e quem grava `jira-ticket` é o hook (novo registro `PostToolUse` em
+> `AskUserQuestion`), não o modelo — por isso a resposta passa a ser persistida também em plan mode. O
+> arquivo `branch-key` deixou de ser escrito (os antigos são removidos pela manutenção de `SessionStart`).
+> `jira.key` na telemetria não muda.
+>
 > **Correção 1.2:** o 1.1.x não lia `~/.claude/remote-settings.json`. Em orgs que distribuem a config
 > OTLP apenas por remote managed settings (sem `managed-settings.json` em disco), o hook não achava
 > endpoint e nenhum `git_context` era emitido — só quem tinha o bloco `env` copiado no próprio
@@ -226,7 +233,7 @@ sai `0` em qualquer erro.
 hooks/
   hooks.json                 # Registro dos hooks
   refresh-plugin-root        # Ponteiro da status line + aviso de Python (SessionStart)
-  jira-context               # Ticket Jira por sessão (SessionStart/UserPromptSubmit)
+  jira-context               # Ticket Jira por sessão (SessionStart/UserPromptSubmit/PostToolUse)
   lang-directive             # Diretiva de idioma pt-BR (PreToolUse/UserPromptExpansion)
   render-history             # Histórico da conversa em HTML (SessionEnd)
   otel-context               # Telemetria OTLP (SessionStart/UserPromptSubmit/SessionEnd)
