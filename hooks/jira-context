@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""afyapowers-core Jira ticket context (UserPromptSubmit + SessionStart).
+"""afyapowers-core Jira ticket context (SessionStart + UserPromptSubmit + PostToolUse).
 
 The single owner of the Jira ticket flow. Context injected at SessionStart
 arrives before the first prompt and the model routinely ignores it when it
@@ -15,36 +15,39 @@ same folder are two different pieces of work, so each one records its own
 answer under the user's Claude config dir:
 
     <config>/afyapowers-core/sessions/<session_id>/
-      jira-ticket   written by the model: `ABC-123` or the literal `none`
-      branch-key    written by this hook: the ticket key extracted from the
-                    git branch at the last prompt (empty when none)
+      jira-ticket   written by this hook (PostToolUse on AskUserQuestion):
+                    `ABC-123` or the literal `none`
 
 `jira-ticket` is what otel-context stamps on telemetry and what the status
 line renders — both resolve it by the session id they already receive. There
 is no project-level pointer anymore: a file shared by every session in the
 folder is exactly what let one session's answer leak into another's telemetry.
 
-Dedup is by state on disk, not by the model's memory:
+The question is asked ONCE per session, and dedup is by state on disk, not by
+the model's memory:
 
-  1. Ask once per session. No session file -> the question goes out with the
-     prompt, recommending the branch key when the branch has one and typing
-     the id otherwise ("no ticket" is always offered, never recommended: the
-     goal is to identify the ticket), and the model is told the exact path
-     to persist the answer to. Outside a git work tree there is no branch
-     to infer from, but the question is asked all the same. As long
-     as the file is missing the question repeats; once written it never comes
-     back for this session — survives `/compact`, and `--resume` inside the
-     prune window does not re-ask.
+  * No session file -> the question goes out with the prompt, recommending
+    the branch key when the branch has one and typing the id otherwise ("no
+    ticket" is always offered, never recommended: the goal is to identify the
+    ticket). Outside a git work tree there is no branch to infer from, but the
+    question is asked all the same. As long as the file is missing the
+    question repeats (the user dismissed it, or the model skipped it).
 
-  2. Re-ask once per branch switch. `branch-key` remembers what the branch
-     suggested last time; the conflict question fires only when that changed
-     AND differs from the recorded ticket, so "keep ABC-1 although the branch
-     says ABC-2" is honoured until the branch actually changes again.
+  * The answer is persisted BY THIS HOOK, not by the model. The question is
+    asked through AskUserQuestion with a fixed header (`Jira ticket`); the
+    PostToolUse hook on that tool recognises that exact header (nothing else:
+    an unrelated question mentioning Jira is ignored), reads the chosen answer
+    and writes the session file — only while the file does not exist yet, so
+    no later question can rewrite it. Delegating the write to the model was
+    the source of repeated questions: in plan mode it cannot write files at
+    all, and outside plan mode it sometimes just does not. The model only
+    writes the file itself as a fallback when AskUserQuestion is unavailable.
 
-  3. Re-ask on a topic shift. A confirmation covers only the work it was
-     given for; the short per-prompt context reminds the model to ask again
-     when a prompt starts a different task. This one stays instruction-based —
-     only the model can tell the subject changed.
+  * Session file present -> a one-line context with the ticket and an
+    explicit "do not ask again". Nothing re-asks: not a branch switch, not a
+    change of subject. The ticket holds for the whole session; a new session
+    starts from scratch. Survives `/compact`, and `--resume` inside the prune
+    window does not re-ask.
 
 Never touches the project: all state lives under the Claude config dir, so
 `.afyapowers/` is neither created nor required (its presence marks a project
@@ -73,8 +76,13 @@ GIT_TIMEOUT = 2
 PRUNE_AGE_S = 7 * 24 * 3600
 PRUNE_CAP = 1000
 SESSION_FILE = "jira-ticket"
-BRANCH_FILE = "branch-key"
-OWNED_FILES = (SESSION_FILE, BRANCH_FILE)
+# `branch-key` was written by 1.2/1.3 next to the session file; it is no
+# longer produced but stays in OWNED_FILES so prune still cleans old dirs.
+OWNED_FILES = (SESSION_FILE, "branch-key")
+# Header the model must give the AskUserQuestion (<= 12 chars); it is how the
+# PostToolUse hook tells the Jira question apart from any other question.
+QUESTION_HEADER = "Jira ticket"
+NO_TICKET_PREFIXES = ("no specific task", "none", "no ticket", "sem ticket", "nenhum")
 
 
 # --------------------------------------------------------------------------- #
@@ -123,13 +131,6 @@ def read_key(path):
     return raw if JIRA_KEY_RE.match(raw) else None
 
 
-def read_text(path):
-    try:
-        return Path(path).read_text(encoding="utf-8").strip()
-    except Exception:
-        return ""
-
-
 def write_text(path, text):
     try:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -172,7 +173,7 @@ def branch_key(cwd):
 def prune(root):
     """Remove session dirs whose owned files were all last touched more than
     PRUNE_AGE_S ago. Only names we could have created, never symlinks, only
-    our two files; rmdir fails harmlessly if anything else is inside."""
+    our own files; rmdir fails harmlessly if anything else is inside."""
     now = time.time()
     try:
         with os.scandir(root) as it:
@@ -218,7 +219,7 @@ def run_session_start():
 
 
 # --------------------------------------------------------------------------- #
-# UserPromptSubmit: the question / the reminder
+# UserPromptSubmit: the question / the one-line context
 # --------------------------------------------------------------------------- #
 
 PRIORITY = "TOP PRIORITY — handle this before anything else in this turn."
@@ -230,14 +231,15 @@ BLOCK_RULES = (
 )
 
 
-def write_rules(session_file):
+def persist_rules(session_file):
     return (
-        "Persist the answer to the session file {} — create its parent directories "
-        "if needed — as exactly one line with no trailing newline: the chosen key "
-        "uppercase (e.g. ABC-123), or the literal none. That file is what telemetry "
-        "and the status line read for THIS session, and what stops this question "
-        "from being asked again."
-    ).format(json.dumps(str(session_file)))
+        "Use exactly {} as the AskUserQuestion header: a hook records the answer "
+        "automatically from that question, so do NOT write any file yourself. Only if "
+        "AskUserQuestion is unavailable, ask in plain text and, once answered, write the "
+        "session file {} yourself — create its parent directories if needed — as exactly "
+        "one line with no trailing newline: the chosen key uppercase (e.g. ABC-123), or "
+        "the literal none."
+    ).format(json.dumps(QUESTION_HEADER), json.dumps(str(session_file)))
 
 
 def describe(key):
@@ -256,34 +258,18 @@ def ask_unset(bkey, session_file):
         options.append("'Another ticket id (Recommended)' (the user types it, e.g. ABC-123)")
     options.append("'No specific task'")
     return "{} The Jira ticket for this session is not set. {} which Jira ticket this work belongs to. Options: {}. {} {}".format(
-        PRIORITY, ASK, ", ".join(options), BLOCK_RULES, write_rules(session_file)
+        PRIORITY, ASK, ", ".join(options), BLOCK_RULES, persist_rules(session_file)
     )
 
 
-def ask_branch_switch(bkey, session_key, session_file):
-    """The branch changed since the last prompt and suggests a different key."""
-    if session_key == "none":
-        recorded = "this session records no specific task"
-        current = "'No specific task (current setting)'"
-    else:
-        recorded = "this session records {}".format(session_key)
-        current = "'Keep {} (current setting)'".format(session_key)
-    return "{} The git branch changed: it now suggests {}, but {}. {} which applies. Options: '{} (from branch) (Recommended)', {}, 'Another ticket id' (the user types it). {} {}".format(
-        PRIORITY, bkey, recorded, ASK, bkey, current, BLOCK_RULES, write_rules(session_file)
-    )
-
-
-def remind(session_key, session_file):
-    """Resolved: a short reminder that keeps the topic-shift rule alive
-    (it has to survive compaction, and only the model can spot a shift)."""
+def resolved(session_key):
+    """Answered: one line so the model knows the ticket (commits, PRs), and an
+    explicit instruction never to ask again in this session."""
     return (
-        "Jira ticket for this session: {}. If this prompt starts a different piece of "
-        "work — another task, feature or bug — ask the user FIRST (AskUserQuestion) "
-        "which ticket it belongs to, before acting on it, and update the session file "
-        "{} with the answer (one line, uppercase key or none, no trailing newline). "
-        "Tangents, follow-ups, questions and sub-tasks of the same work do not count "
-        "as a shift."
-    ).format(describe(session_key), json.dumps(str(session_file)))
+        "Jira ticket for this session: {}. It was already confirmed by the user for "
+        "this whole session — do not ask about the Jira ticket again, even if the task, "
+        "branch or subject changes."
+    ).format(describe(session_key))
 
 
 def run_prompt(payload):
@@ -291,30 +277,20 @@ def run_prompt(payload):
     cwd = payload.get("cwd") or os.getcwd()
     if not session_id:
         return  # without a session there is nothing to attach the ticket to
-    # Outside a git work tree `branch_key` is simply empty: the question is
-    # asked everywhere, only the branch inference needs a repo.
 
     sdir = session_dir(session_id)
     if sdir is None:
         return
     session_file = sdir / SESSION_FILE
-    branch_file = sdir / BRANCH_FILE
-
     session_key = read_key(session_file)
-    bkey = branch_key(cwd)
-    prev_bkey = read_text(branch_file)
 
     if session_key is None:
-        msg = ask_unset(bkey, session_file)
-    elif bkey and bkey != session_key and bkey != prev_bkey:
-        msg = ask_branch_switch(bkey, session_key, session_file)
+        # Outside a git work tree `branch_key` is simply empty: the question is
+        # asked everywhere, only the recommendation needs a repo.
+        msg = ask_unset(branch_key(cwd), session_file)
     else:
-        msg = remind(session_key, session_file)
-
-    # Remember what the branch suggested (so the switch question fires once
-    # per switch) and keep the live session out of the prune window.
-    write_text(branch_file, bkey)
-    if session_key is not None:
+        msg = resolved(session_key)
+        # Keep the live session out of the prune window.
         try:
             os.utime(session_file, None)
         except OSError:
@@ -328,14 +304,96 @@ def run_prompt(payload):
     }))
 
 
+# --------------------------------------------------------------------------- #
+# PostToolUse (AskUserQuestion): persist the answer
+# --------------------------------------------------------------------------- #
+
+def is_jira_question(question):
+    """Only the fixed header counts. No fuzzy fallback on the question text:
+    an unrelated question that merely mentions Jira ("link the Jira ticket in
+    the PR?") must never be able to rewrite the session ticket."""
+    header = str(question.get("header") or "").strip().lower()
+    return header == QUESTION_HEADER.lower()
+
+
+def find_answer(question_text, tool_response):
+    """The answer to `question_text` out of the tool response. Structured
+    shape (what Claude Code stores): {"answers": {question: label}}. Fallback:
+    a text blob shaped `"<question>"="<answer>"` (the tool_result wording)."""
+    if isinstance(tool_response, dict):
+        answers = tool_response.get("answers")
+        if isinstance(answers, dict) and question_text in answers:
+            value = answers[question_text]
+            if isinstance(value, list):
+                value = value[0] if value else ""
+            return str(value)
+        text = tool_response.get("text") or tool_response.get("content") or ""
+    else:
+        text = tool_response or ""
+    if isinstance(text, list):  # content blocks
+        text = " ".join(str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in text)
+    text = str(text)
+    match = re.search(re.escape(json.dumps(question_text)) + r'\s*=\s*"((?:[^"\\]|\\.)*)"', text)
+    if match:
+        try:
+            return json.loads('"' + match.group(1) + '"')
+        except ValueError:
+            return match.group(1)
+    return None
+
+
+def parse_answer(text):
+    """Chosen label or free text -> validated key, `none`, or None when the
+    answer carries no decision (e.g. 'Another ticket id' picked without an id:
+    the question will simply come back with the next prompt)."""
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw:
+        return None
+    match = BRANCH_KEY_RE.search(raw)
+    if match:
+        key = match.group(0).upper()
+        return key if JIRA_KEY_RE.match(key) else None
+    lowered = raw.lower()
+    if lowered.startswith(NO_TICKET_PREFIXES):
+        return "none"
+    return None
+
+
+def run_post_tool_use(payload):
+    sdir = session_dir(payload.get("session_id"))
+    if sdir is None:
+        return
+    session_file = sdir / SESSION_FILE
+    if read_key(session_file) is not None:
+        return  # asked once per session: an existing answer is never rewritten
+    tool_input = payload.get("tool_input") or {}
+    questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
+    if not isinstance(questions, list):
+        return
+    for question in questions:
+        if not isinstance(question, dict) or not is_jira_question(question):
+            continue
+        answer = find_answer(str(question.get("question") or ""), payload.get("tool_response"))
+        key = parse_answer(answer)
+        if key is not None:
+            write_text(session_file, key)
+        return  # one Jira question per AskUserQuestion call
+
+
 def main():
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
         if not isinstance(payload, dict):
             payload = {}
-        if payload.get("hook_event_name") == "SessionStart":
+        event = payload.get("hook_event_name")
+        if event == "SessionStart":
             run_session_start()
+        elif event == "PostToolUse":
+            if payload.get("tool_name") == "AskUserQuestion":
+                run_post_tool_use(payload)
         else:
             run_prompt(payload)
     except Exception:
