@@ -78,7 +78,10 @@ PRUNE_CAP = 1000
 SESSION_FILE = "jira-ticket"
 # `branch-key` was written by 1.2/1.3 next to the session file; it is no
 # longer produced but stays in OWNED_FILES so prune still cleans old dirs.
-OWNED_FILES = (SESSION_FILE, "branch-key")
+# Files the prune may delete: ours plus the context hook's send state
+# (emit-session-context writes them next to the ticket). A file missing from this
+# list keeps its session dir from ever being removed.
+OWNED_FILES = (SESSION_FILE, "branch-key", "context-sent.json", "context-sending.lock")
 # Header the model must give the AskUserQuestion (<= 12 chars); it is how the
 # PostToolUse hook tells the Jira question apart from any other question.
 QUESTION_HEADER = "Jira ticket"
