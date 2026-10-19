@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""afyapowers-core Jira ticket context (SessionStart + UserPromptSubmit + PostToolUse).
+"""afyapowers-core Jira ticket context (UserPromptSubmit + PostToolUse).
 
 The single owner of the Jira ticket flow. Context injected at SessionStart
 arrives before the first prompt and the model routinely ignores it when it
@@ -55,9 +55,11 @@ as afyapowers-enabled — owned by afyapowers-dev). Never blocks: any error ->
 exit 0, and nothing but the expected JSON is ever written to stdout (on
 UserPromptSubmit it is injected as context).
 
-SessionStart is housekeeping only: create `sessions/` and prune entries unused
-for more than 7 days (the session file is touched on every prompt, so a live or
-recently resumed session never expires while in use).
+Housekeeping runs when a new session's ticket is recorded: session dirs
+unused for more than 7 days are pruned (the session file is touched on every
+prompt, so a live or recently resumed session never expires while in use).
+There is no SessionStart hook: it had no model turn to act on and only
+duplicated what the first prompt carries.
 """
 
 import itertools
@@ -170,7 +172,7 @@ def branch_key(cwd):
 
 
 # --------------------------------------------------------------------------- #
-# SessionStart: housekeeping
+# Housekeeping (on a new session's first recorded ticket)
 # --------------------------------------------------------------------------- #
 
 def prune(root):
@@ -208,17 +210,6 @@ def prune(root):
                 pass
         except OSError:
             pass
-
-
-def run_session_start():
-    root = sessions_root()
-    if root is not None:
-        try:
-            root.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        prune(root)
-    print("{}")
 
 
 # --------------------------------------------------------------------------- #
@@ -408,6 +399,9 @@ def run_post_tool_use(payload):
         key = parse_answer(answer)
         if key is not None:
             write_text(session_file, key)
+            root = sessions_root()
+            if root is not None:
+                prune(root)  # once per session: the ticket is recorded only once
             trigger_context(payload)
         return  # one Jira question per AskUserQuestion call
 
@@ -420,8 +414,8 @@ def main():
             payload = {}
         event = payload.get("hook_event_name")
         if event == "SessionStart":
-            run_session_start()
-        elif event == "PostToolUse":
+            return  # not registered there anymore; never act on it
+        if event == "PostToolUse":
             if payload.get("tool_name") == "AskUserQuestion":
                 run_post_tool_use(payload)
         else:

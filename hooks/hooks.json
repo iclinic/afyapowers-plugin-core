@@ -8,15 +8,6 @@
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/refresh-plugin-root"
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/track-jira-ticket",
-            "timeout": 5
-          }
-        ]
       }
     ],
     "UserPromptSubmit": [
