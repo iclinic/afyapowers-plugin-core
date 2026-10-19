@@ -12,12 +12,23 @@ the Claude Code process, so values like the current git branch can never reach
 the same collector, tagged with `session.id` and `prompt.id` — the standard
 attributes on every native `claude_code.*` event — so the backend can join them.
 
+When it sends (core 1.4): once the session's ticket is known — the ticket hook
+calls this one right after recording an answer (a key or "no ticket"), and the
+first prompt of a resumed session that already has one also counts — and then
+only when the repo or the branch changes. Prompts with no change send nothing;
+there is no send at SessionStart or SessionEnd. The last state that reached the
+collector is kept in the session folder (`context-sent.json`) and is written only
+on a 2xx, so a failed send is retried on the next prompt instead of leaving a
+healthy session looking mute.
+
 Two modes, so nothing on the prompt's critical path touches git or the network:
 
-  (default)  Hook entrypoint. Resolves config, and if telemetry is on, spawns a
-             detached child with {config, payload} on stdin. Returns immediately.
-  --emit     The detached child. Collects git attributes, encodes the OTLP
-             payload, POSTs it, exits silently.
+  (default)  Hook entrypoint. Leaves at once while the session has no ticket
+             yet; otherwise resolves config and spawns a detached child with
+             {config, payload} on stdin. Returns immediately.
+  --emit     The detached child. Collects git attributes, decides whether this
+             is a first send or a repo/branch change, encodes the OTLP payload,
+             POSTs it, exits silently.
 
 Speaks both `http/protobuf` (the OTel default, and what collectors that reject
 JSON require) and `http/json`, selected from AFYAPOWERS_OTLP_LOGS_PROTOCOL.
@@ -339,6 +350,67 @@ def session_ticket_file(session_id):
     if not safe:
         return None
     return Path(base) / "afyapowers-core" / "sessions" / safe / "jira-ticket"
+
+
+def ticket_known(session_id):
+    """True once the user answered the ticket question for this session: the
+    session file holds a key or the literal `none` ("no ticket")."""
+    path = session_ticket_file(session_id)
+    if path is None:
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return False
+    return raw.lower() == "none" or bool(JIRA_KEY_RE.match(raw.upper()))
+
+
+SENT_STATE_FILE = "context-sent.json"   # repo/branch last confirmed by the collector
+SENDING_LOCK_FILE = "context-sending.lock"
+SENDING_LOCK_STALE_S = 30
+
+
+def _plain(value):
+    return None if value is ATTR_NULL else value
+
+
+def needs_send(state_path, repo, branch):
+    """First send of the session (no state yet) or a repo/branch change."""
+    try:
+        prev = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return True
+    return prev.get("repo") != repo or prev.get("branch") != branch
+
+
+def claim_send(lock_path):
+    """Exclusive claim so two triggers firing together (the ticket hook and a
+    prompt) send once. A lock older than SENDING_LOCK_STALE_S is a crashed send
+    and is taken over."""
+    for _ in range(2):
+        try:
+            os.close(os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > SENDING_LOCK_STALE_S:
+                    lock_path.unlink()
+                    continue
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+    return False
+
+
+def save_sent_state(state_path, repo, branch):
+    try:
+        tmp = state_path.with_name("{}.{}.tmp".format(state_path.name, os.getpid()))
+        tmp.write_text(json.dumps({"repo": repo, "branch": branch}), encoding="utf-8")
+        os.replace(tmp, state_path)
+    except Exception:
+        pass
 
 
 def jira_key(session_id):
@@ -675,6 +747,28 @@ def emit(config, payload):
     """
     cwd = config["cwd"]
 
+    # Send only on the first send of the session or a repo/branch change.
+    git = git_attrs(cwd, config["git_dirty"])
+    repo, branch = _plain(git.get("git.repo")), _plain(git.get("git.branch"))
+    ticket_file = session_ticket_file(payload.get("session_id"))
+    sdir = ticket_file.parent if ticket_file else None
+    if sdir is None:
+        return
+    state_path, lock_path = sdir / SENT_STATE_FILE, sdir / SENDING_LOCK_FILE
+    if not needs_send(state_path, repo, branch) or not claim_send(lock_path):
+        return
+    try:
+        _send(config, payload, git, state_path, repo, branch)
+    finally:
+        try:
+            lock_path.unlink()
+        except Exception:
+            pass
+
+
+def _send(config, payload, git, state_path, repo, branch):
+    cwd = config["cwd"]
+
     # session.id / prompt.id are the join keys against the native claude_code.*
     # events — structural, not optional. prompt_id is absent before first input.
     attrs = {
@@ -688,7 +782,7 @@ def emit(config, payload):
         # Which plugin build produced this session — lets the backend correlate a
         # behavior change with the release that shipped it.
         "afyapowers.version": plugin_version() or ATTR_NULL,
-        **git_attrs(cwd, config["git_dirty"]),
+        **git,
     }
     # Optional host/account identity: user.email mirrors the native claude_code.*
     # events, host.name follows OTel host semconv. Omitted (never null) when
@@ -734,6 +828,8 @@ def emit(config, payload):
     except Exception as exc:  # network, TLS, collector down — all silent
         error = "{}: {}".format(type(exc).__name__, exc)
     record_send(config["endpoint"], status, error)
+    if isinstance(status, int) and 200 <= status < 300:
+        save_sent_state(state_path, repo, branch)  # only what reached the collector
 
 
 # --------------------------------------------------------------------------- #
@@ -763,6 +859,8 @@ def spawn_detached(blob):
 
 def run_hook():
     payload = json.loads(sys.stdin.read() or "{}")
+    if not ticket_known(payload.get("session_id")):
+        return  # nothing to send before the ticket is known (no attempt, no record)
     config, reason = resolve_config(payload)
     if config is None:
         record_send(None, None, reason)  # no destination: recorded, never shown
