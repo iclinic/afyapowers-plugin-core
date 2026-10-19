@@ -65,10 +65,10 @@ There is no SessionStart hook: it had no model turn to act on and only
 duplicated what the first prompt carries.
 """
 
-import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -79,15 +79,9 @@ BRANCH_KEY_RE = re.compile(r"[A-Z][A-Z0-9]+-[0-9]+", re.IGNORECASE)
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 GIT_TIMEOUT = 2
 PRUNE_AGE_S = 7 * 24 * 3600
-PRUNE_CAP = 1000
+PRUNE_MAX_REMOVALS = 100  # per run, so a long backlog never outlasts the hook timeout
 SESSION_FILE = "jira-ticket"
-# `branch-key` was written by 1.2/1.3 next to the session file; it is no
-# longer produced but stays in OWNED_FILES so prune still cleans old dirs.
-# Files the prune may delete: ours plus the context hook's send state
-# (emit-session-context writes them next to the ticket). A file missing from this
-# list keeps its session dir from ever being removed.
 ASKED_FILE = "ticket-asked"
-OWNED_FILES = (SESSION_FILE, ASKED_FILE, "branch-key", "context-sent.json")
 # Header the model must give the AskUserQuestion (<= 12 chars); it is how the
 # PostToolUse hook tells the Jira question apart from any other question.
 QUESTION_HEADER = "Ticket Jira"
@@ -191,38 +185,33 @@ def branch_key(cwd):
 # --------------------------------------------------------------------------- #
 
 def prune(root):
-    """Remove session dirs whose owned files were all last touched more than
-    PRUNE_AGE_S ago. Only names we could have created, never symlinks, only
-    our own files; rmdir fails harmlessly if anything else is inside."""
+    """Remove whole session dirs (`sessions/<id>/`, created only by the core)
+    whose newest file is older than PRUNE_AGE_S. No list of known files: any
+    file inside counts for the age and goes with the dir. Skips symlinks and
+    names we could not have created; at most PRUNE_MAX_REMOVALS per run; every
+    failure is ignored. Never touches `sessions/` itself or anything above it."""
     now = time.time()
+    removed = 0
     try:
-        with os.scandir(root) as it:
-            entries = list(itertools.islice(it, PRUNE_CAP))
+        entries = list(os.scandir(root))
     except OSError:
         return
     for entry in entries:
+        if removed >= PRUNE_MAX_REMOVALS:
+            return
         try:
             if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                 continue
             if not SAFE_NAME_RE.match(entry.name):
                 continue
-            newest = 0.0
-            for name in OWNED_FILES:
-                try:
-                    newest = max(newest, os.lstat(os.path.join(entry.path, name)).st_mtime)
-                except OSError:
-                    pass
-            if newest and now - newest < PRUNE_AGE_S:
+            newest = os.lstat(entry.path).st_mtime
+            with os.scandir(entry.path) as files:
+                for f in files:
+                    newest = max(newest, f.stat(follow_symlinks=False).st_mtime)
+            if now - newest < PRUNE_AGE_S:
                 continue
-            for name in OWNED_FILES:
-                try:
-                    os.unlink(os.path.join(entry.path, name))
-                except OSError:
-                    pass
-            try:
-                os.rmdir(entry.path)
-            except OSError:
-                pass
+            shutil.rmtree(entry.path)
+            removed += 1
         except OSError:
             pass
 
