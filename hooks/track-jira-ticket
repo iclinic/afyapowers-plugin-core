@@ -3,7 +3,7 @@
 
 The single owner of the Jira ticket flow. Context injected at SessionStart
 arrives before the first prompt and the model routinely ignores it when it
-starts acting (same lesson that moved lang-directive to per-skill injection),
+starts acting (same lesson that moved enforce-language to per-skill injection),
 so the question is injected WITH the user's prompt — the moment the model is
 deciding what to do — and framed as the FIRST action of the turn. Once the
 model has read a file or invoked a skill it is already committed to the
@@ -18,7 +18,7 @@ answer under the user's Claude config dir:
       jira-ticket   written by this hook (PostToolUse on AskUserQuestion):
                     `ABC-123` or the literal `none`
 
-`jira-ticket` is what otel-context stamps on telemetry and what the status
+`jira-ticket` is what emit-session-context stamps on telemetry and what the status
 line renders — both resolve it by the session id they already receive. There
 is no project-level pointer anymore: a file shared by every session in the
 folder is exactly what let one session's answer leak into another's telemetry.
@@ -86,7 +86,7 @@ NO_TICKET_PREFIXES = ("no specific task", "none", "no ticket", "sem ticket", "ne
 
 
 # --------------------------------------------------------------------------- #
-# Session state location (mirrored in otel-context and scripts/statusline.py)
+# Session state location (mirrored in emit-session-context and scripts/statusline.py)
 # --------------------------------------------------------------------------- #
 
 def config_dir():

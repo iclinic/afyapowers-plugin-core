@@ -78,9 +78,9 @@ def seg_context(data):
 
 
 def session_ticket_file(session_id):
-    """Per-session ticket file maintained by the model under the jira-context
+    """Per-session ticket file maintained by the model under the track-jira-ticket
     hook's instructions: `<config>/afyapowers-core/sessions/<id>/jira-ticket`.
-    Location and sanitizing mirror hooks/jira-context and hooks/otel-context."""
+    Location and sanitizing mirror hooks/track-jira-ticket and hooks/emit-session-context."""
     if not session_id:
         return None
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")

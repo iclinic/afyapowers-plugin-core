@@ -10,10 +10,10 @@ Funciona de forma independente do workflow de fases do [afyapowers](https://gith
 
 | Componente | Evento(s) | O que faz |  
 |---|---|---|
-| [`hooks/jira-context`](#contexto-de-jira) | `SessionStart`, `UserPromptSubmit`, `PostToolUse` (AskUserQuestion) | Confirma o ticket Jira **uma vez por sessão**, grava a resposta e o injeta como contexto de cada prompt |
-| [`hooks/lang-directive`](#diretiva-de-idioma-pt-br) | `PreToolUse` (Skill), `UserPromptExpansion` | Reinjeta a diretiva de idioma pt-BR quando qualquer skill `afyapowers*:` é invocada |
+| [`hooks/track-jira-ticket`](#contexto-de-jira) | `SessionStart`, `UserPromptSubmit`, `PostToolUse` (AskUserQuestion) | Confirma o ticket Jira **uma vez por sessão**, grava a resposta e o injeta como contexto de cada prompt |
+| [`hooks/enforce-language`](#diretiva-de-idioma-pt-br) | `PreToolUse` (Skill), `UserPromptExpansion` | Reinjeta a diretiva de idioma pt-BR quando qualquer skill `afyapowers*:` é invocada |
 | [`hooks/render-history`](#histórico-de-conversas) | `SessionEnd` | Renderiza a conversa da sessão em HTML autocontido |
-| [`hooks/otel-context`](#telemetria-opentelemetry) | `SessionStart`, `UserPromptSubmit`, `SessionEnd` | Emite log records OTLP com contexto de git/Jira/versão |
+| [`hooks/emit-session-context`](#telemetria-opentelemetry) | `SessionStart`, `UserPromptSubmit`, `SessionEnd` | Emite log records OTLP com contexto de git/Jira/versão |
 | [`hooks/refresh-plugin-root`](#ponteiro-de-instalação-e-pré-requisitos) | `SessionStart` | Regrava o ponteiro usado pela status line e avisa se o Python está ausente |
 | [`scripts/statusline.py`](#status-line) + `/afyapowers-core:statusline` | — | Status line opt-in: marca afyapowers, modelo, contexto, ticket Jira, git, custo e duração |
 
@@ -31,7 +31,7 @@ Todos os hooks seguem o mesmo contrato:
 
 ### Contexto de Jira
 
-`hooks/jira-context` é o dono do fluxo de ticket Jira. O ticket é **por sessão**, não por projeto: duas sessões do Claude Code abertas na mesma pasta são dois trabalhos distintos, e cada uma grava a própria resposta em
+`hooks/track-jira-ticket` é o dono do fluxo de ticket Jira. O ticket é **por sessão**, não por projeto: duas sessões do Claude Code abertas na mesma pasta são dois trabalhos distintos, e cada uma grava a própria resposta em
 
 ```text
 ~/.claude/afyapowers-core/sessions/<session_id>/
@@ -56,11 +56,11 @@ Em `SessionStart` o hook só faz manutenção: cria `sessions/` e remove entrada
 
 O hook não toca no projeto (nem `.afyapowers/` nem `.gitignore`). Fora de um repositório git a pergunta é feita do mesmo jeito — só a sugestão a partir da branch precisa de um repositório.
 
-> **Follow-up no afyapowers-dev:** a skill `design` ainda grava `.afyapowers/current-jira-ticket` (e `/new` o cria vazio), que nada mais lê. Para o ticket validado no design refletir na sessão corrente, ela deve passar a gravar o arquivo de sessão cujo caminho o `jira-context` informa no contexto de cada prompt.
+> **Follow-up no afyapowers-dev:** a skill `design` ainda grava `.afyapowers/current-jira-ticket` (e `/new` o cria vazio), que nada mais lê. Para o ticket validado no design refletir na sessão corrente, ela deve passar a gravar o arquivo de sessão cujo caminho o `track-jira-ticket` informa no contexto de cada prompt.
 
 ### Diretiva de idioma pt-BR
 
-`hooks/lang-directive` reinjeta a diretiva de idioma da família afyapowers no momento em que ela é mais necessária: quando uma skill `afyapowers*:` é invocada — pelo modelo (`PreToolUse` no tool `Skill`) ou pelo usuário via slash command (`UserPromptExpansion`).
+`hooks/enforce-language` reinjeta a diretiva de idioma da família afyapowers no momento em que ela é mais necessária: quando uma skill `afyapowers*:` é invocada — pelo modelo (`PreToolUse` no tool `Skill`) ou pelo usuário via slash command (`UserPromptExpansion`).
 
 A diretiva instrui o modelo a conversar e escrever todos os artefatos afyapowers em português do Brasil, tratando os templates em inglês dentro das skills como guia de conteúdo (não texto final), mantendo em inglês os termos técnicos convencionais e os identificadores de fase do workflow, e nunca traduzindo código, identificadores ou caminhos de arquivo.
 
@@ -100,12 +100,12 @@ estritamente estático (sem interpolação, sem command substitution) e nenhum h
 var de volta para o processo do Claude Code. Ou seja, a branch atual jamais chega em
 `OTEL_RESOURCE_ATTRIBUTES`.
 
-O hook `otel-context` resolve isso emitindo **log records OTLP próprios** para o mesmo coletor, em
+O hook `emit-session-context` resolve isso emitindo **log records OTLP próprios** para o mesmo coletor, em
 `SessionStart`, `UserPromptSubmit` e `SessionEnd`. Cada record carrega:
 
 | Atributo | Exemplo | Observação |
 |---|---|---|
-| `event.name` | `afyapowers-core.git_context` | discrimina nossos records dos nativos |
+| `event.name` | `afyapowers-core.session_context` | discrimina nossos records dos nativos |
 | `session.id` | `abc123` | **chave de join** com os eventos `claude_code.*` |
 | `prompt.id` | `550e8400-…` | join exato por prompt; ausente no `SessionStart` |
 | `hook.event` | `UserPromptSubmit` | qual evento originou o record |
@@ -128,7 +128,7 @@ records também, então filtram igual aos eventos nativos.
 
 **Como correlacionar:** no backend, junte nossos records aos nativos por `prompt.id` (exato) ou por
 `session.id` (sessão inteira). Ex.: custo de tokens por branch = `claude_code.token.usage` ⨝
-`event.name = 'afyapowers-core.git_context'` em `prompt.id`.
+`event.name = 'afyapowers-core.session_context'` em `prompt.id`.
 
 **`jira.key` no primeiro record:** o hook dispara junto com o prompt, antes de o modelo perguntar e o
 usuário responder, então o record de `SessionStart` e o do primeiro `UserPromptSubmit` de cada sessão
@@ -233,10 +233,10 @@ sai `0` em qualquer erro.
 hooks/
   hooks.json                 # Registro dos hooks
   refresh-plugin-root        # Ponteiro da status line + aviso de Python (SessionStart)
-  jira-context               # Ticket Jira por sessão (SessionStart/UserPromptSubmit/PostToolUse)
-  lang-directive             # Diretiva de idioma pt-BR (PreToolUse/UserPromptExpansion)
+  track-jira-ticket               # Ticket Jira por sessão (SessionStart/UserPromptSubmit/PostToolUse)
+  enforce-language             # Diretiva de idioma pt-BR (PreToolUse/UserPromptExpansion)
   render-history             # Histórico da conversa em HTML (SessionEnd)
-  otel-context               # Telemetria OTLP (SessionStart/UserPromptSubmit/SessionEnd)
+  emit-session-context               # Telemetria OTLP (SessionStart/UserPromptSubmit/SessionEnd)
 scripts/
   statusline.py              # Renderizador da status line
 skills/

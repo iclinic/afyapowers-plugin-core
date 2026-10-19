@@ -13,7 +13,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/otel-context",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/emit-session-context",
             "timeout": 5
           }
         ]
@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/jira-context",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/track-jira-ticket",
             "timeout": 5
           }
         ]
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/otel-context",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/emit-session-context",
             "timeout": 5
           }
         ]
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/jira-context",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/track-jira-ticket",
             "timeout": 5
           }
         ]
@@ -54,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/jira-context",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/track-jira-ticket",
             "timeout": 5
           }
         ]
@@ -66,7 +66,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/lang-directive claude"
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/enforce-language claude"
           }
         ]
       }
@@ -77,7 +77,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/lang-directive claude"
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/enforce-language claude"
           }
         ]
       }
@@ -95,7 +95,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/otel-context",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/emit-session-context",
             "timeout": 5
           }
         ]
