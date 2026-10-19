@@ -20,7 +20,7 @@ Two modes, so nothing on the prompt's critical path touches git or the network:
              payload, POSTs it, exits silently.
 
 Speaks both `http/protobuf` (the OTel default, and what collectors that reject
-JSON require) and `http/json`, selected from OTEL_EXPORTER_OTLP_LOGS_PROTOCOL.
+JSON require) and `http/json`, selected from AFYAPOWERS_OTLP_LOGS_PROTOCOL.
 The protobuf encoder is hand-rolled because the plugin is stdlib-only.
 
 Contract: this is observability only. It must NEVER block a session or crash a
@@ -78,166 +78,54 @@ def parse_kv(raw):
     return out
 
 
-def managed_settings_path():
-    if sys.platform == "darwin":
-        return Path("/Library/Application Support/ClaudeCode/managed-settings.json")
-    if os.name == "nt":
-        return Path(r"C:\Program Files\ClaudeCode\managed-settings.json")
-    return Path("/etc/claude-code/managed-settings.json")
-
-
-def config_dir():
-    """Claude Code's per-user config directory (`~/.claude`, or
-    CLAUDE_CONFIG_DIR). Same resolution as `session_ticket_file`."""
-    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-
-
-def _merge_env(paths):
-    """Merged `env` blocks of the given settings files; later files win.
-    Unreadable or malformed files are skipped."""
-    merged = {}
-    for path in paths:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        env = data.get("env") if isinstance(data, dict) else None
-        if isinstance(env, dict):
-            merged.update({k: str(v) for k, v in env.items() if v is not None})
-    return merged
-
-
-def settings_env(cwd):
-    """The `env` blocks of every settings file Claude Code loads, as two maps:
-    (user_env, managed_env).
-
-    user_env merges user < project < project local. managed_env merges
-    endpoint-managed < server-managed: `managed-settings.json`, then the
-    `managed-settings.d/` drop-ins beside it in name order, then
-    `<config>/remote-settings.json` — the cache of the settings an org admin
-    sets in the claude.ai console. In a fleet rolled out that way the cache is
-    the ONLY place the OTLP endpoint exists: no managed-settings.json on disk,
-    nothing in the user's settings.json.
-
-    They are returned separately because they sit on opposite sides of the
-    process environment (see `resolve_config`). Reading the files is the
-    primary source, not a fallback: settings-file `env` vars are not inherited
-    by hook subprocesses, so `os.environ` only carries what the developer's
-    shell exported.
-    """
-    user_paths = [config_dir() / "settings.json"]
-    if cwd:
-        user_paths.append(Path(cwd) / ".claude" / "settings.json")
-        user_paths.append(Path(cwd) / ".claude" / "settings.local.json")
-
-    managed = managed_settings_path()
-    managed_paths = [managed]
-    try:
-        managed_paths.extend(sorted((managed.parent / "managed-settings.d").glob("*.json")))
-    except Exception:
-        pass
-    managed_paths.append(config_dir() / "remote-settings.json")
-
-    return _merge_env(user_paths), _merge_env(managed_paths)
-
-
 def resolve_config(payload):
-    """Build the emitter config, or return (None, reason) when telemetry is
-    unroutable (no endpoint, or a protocol we cannot speak).
+    """Build the emitter config, or return (None, reason) when there is nowhere
+    to send to.
 
-    The routing keys — endpoint, protocol and headers — are resolved per tier
-    and then across tiers, managed settings winning: for each key the highest
-    tier that sets it (managed `env` > process environment > user/project `env`,
-    see `settings_env`) decides, and OTel's per-signal alias beats the generic
-    one *within* that tier. Managed settings thus lock the destination the
-    organization chose; nothing a user exports in a shell or writes in a dotfile
-    — not even through the per-signal OTEL_EXPORTER_OTLP_LOGS_ENDPOINT alias —
-    can redirect the telemetry, because a lower tier is never consulted once a
-    higher one has set the route. (Resolving on a single merged map instead
-    would leak exactly that redirect: the per-signal and generic aliases are
-    distinct keys, so a lower tier's per-signal one would survive the merge and
-    then win OTel precedence over a higher tier's generic one.)
+    The destination comes ONLY from our own variables, which the organization
+    sets in the `env` block of the Claude Code policy next to the OTEL_* ones:
 
-    Non-routing reads — the organization's static resource attributes and our
-    own boolean flags — still come from a merged map where managed wins per key.
+      AFYAPOWERS_OTLP_LOGS_ENDPOINT  the full OTLP logs URL, used as is
+      AFYAPOWERS_OTLP_LOGS_HEADERS   `k=v,k=v`, percent-decoded per OTel spec
+      AFYAPOWERS_OTLP_LOGS_PROTOCOL  http/protobuf (default) or http/json
 
-    There is deliberately no plugin-specific override of the endpoint, headers
-    or protocol: the destination belongs to the organization and comes from its
-    managed settings, never from something a user can point elsewhere.
+    Claude Code strips OTEL_* from hook subprocesses but passes these through,
+    already resolved with its own precedence (the policy wins over user and
+    project settings), so the process environment is the single source: no
+    settings files, no `remote-settings.json` cache, no OTEL_* — the layered
+    lookup of 1.3 left the hook mute wherever the cache was stale or missing.
+    For a local test, the same variables in user or project settings work.
+
+    Where there is no policy (Cowork, or a machine that never received it) the
+    variables are absent and the hook stays silent: no send, no output, no error.
     """
     cwd = payload.get("cwd") or os.getcwd()
-    user_env, managed_env = settings_env(cwd)
-    process_env = {k: v for k, v in os.environ.items() if v}
-    # Highest priority first. Routing keys are read tier by tier off this order,
-    # never off a flattened map, so a lower tier cannot reroute a higher one.
-    tiers = (managed_env, process_env, user_env)
-
-    def signal(specific, generic, transform=None):
-        """First tier that sets either alias decides; within it the per-signal
-        value wins, else the generic one (through `transform`)."""
-        for tier in tiers:
-            value = tier.get(specific) or None
-            if value:
-                return value
-            base = tier.get(generic) or None
-            if base:
-                return transform(base) if transform else base
-        return None
-
-    # The merged map (managed wins per key) backs only the non-routing reads.
-    env = dict(user_env)
-    env.update(process_env)
-    env.update(managed_env)
 
     def get(name):
-        return env.get(name) or None
+        return os.environ.get(name) or None
 
-    # No opt-in and no kill switch: the hook always emits when it has somewhere
-    # to send to. The only reasons to stay silent are missing routing data (no
-    # endpoint) or a transport we cannot speak (grpc).
-    endpoint = signal(
-        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-        transform=lambda base: base.rstrip("/") + "/v1/logs",
-    )
+    endpoint = get("AFYAPOWERS_OTLP_LOGS_ENDPOINT")
     if not endpoint:
-        return None, "no OTLP logs endpoint configured"
+        return None, "no AFYAPOWERS_OTLP_LOGS_ENDPOINT"
 
-    protocol = (
-        signal("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "OTEL_EXPORTER_OTLP_PROTOCOL")
-        or DEFAULT_PROTOCOL
-    )
+    protocol = get("AFYAPOWERS_OTLP_LOGS_PROTOCOL") or DEFAULT_PROTOCOL
     if protocol == "grpc":
-        # We only speak OTLP over HTTP; the org's logs route must be http/*.
-        return None, "grpc protocol unsupported; configure an http/protobuf or http/json logs endpoint"
+        # We only speak OTLP over HTTP.
+        return None, "grpc protocol unsupported; use http/protobuf or http/json"
 
-    # Headers come whole from the same winning tier as the rest of the route, so
-    # a lower tier cannot pin auth headers onto a managed endpoint. Within that
-    # tier the per-signal headers merge over the generic ones.
-    headers = {}
-    for tier in tiers:
-        generic = tier.get("OTEL_EXPORTER_OTLP_HEADERS") or None
-        specific = tier.get("OTEL_EXPORTER_OTLP_LOGS_HEADERS") or None
-        if generic or specific:
-            headers = parse_kv(generic)
-            headers.update(parse_kv(specific))
-            break
-    # The inherited headers may pin a content-type for the native exporter's
-    # encoding; ours is decided by `protocol`, so drop any inherited copy.
-    headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
-
-    # Carry the organization's static resource attributes (department, cost
-    # center) onto our records too, so they filter like the native events.
-    resource = parse_kv(get("OTEL_RESOURCE_ATTRIBUTES"))
-    resource["service.name"] = (
-        get("OTEL_SERVICE_NAME") or resource.get("service.name") or DEFAULT_SERVICE_NAME
-    )
+    # The headers may pin a content-type for the native exporter's encoding;
+    # ours is decided by `protocol`, so drop any copy.
+    headers = {
+        k: v
+        for k, v in parse_kv(get("AFYAPOWERS_OTLP_LOGS_HEADERS")).items()
+        if k.lower() != "content-type"
+    }
 
     return {
         "endpoint": endpoint,
         "protocol": protocol,
         "headers": headers,
-        "resource": resource,
+        "resource": {"service.name": DEFAULT_SERVICE_NAME},
         "cwd": cwd,
         "git_dirty": get("AFYAPOWERS_CORE_OTEL_GIT_DIRTY") == "1",
         "debug": get("AFYAPOWERS_CORE_OTEL_DEBUG") == "1",
@@ -482,7 +370,7 @@ def account_config_path():
     """Path to Claude Code's main config file (`.claude.json`), which holds the
     logged-in account. It lives at `$CLAUDE_CONFIG_DIR/.claude.json` when that
     var is set, else `~/.claude.json`. Note it is a SIBLING of the `~/.claude`
-    config dir, not a file inside it, so this cannot reuse `config_dir()`."""
+    config dir, not a file inside it."""
     base = os.environ.get("CLAUDE_CONFIG_DIR")
     return (Path(base) if base else Path.home()) / ".claude.json"
 
