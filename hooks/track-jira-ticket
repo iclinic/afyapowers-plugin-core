@@ -15,8 +15,8 @@ same folder are two different pieces of work, so each one records its own
 answer under the user's Claude config dir:
 
     <config>/afyapowers-core/sessions/<session_id>/
-      jira-ticket   written by this hook (PostToolUse on AskUserQuestion):
-                    `ABC-123` or the literal `none`
+      jira-ticket   written by this hook: `ABC-123` or the literal `none`
+      ticket-asked  marker: the question went out in this session
 
 `jira-ticket` is what emit-session-context stamps on telemetry and what the status
 line renders — both resolve it by the session id they already receive. There
@@ -26,22 +26,25 @@ folder is exactly what let one session's answer leak into another's telemetry.
 The question is asked ONCE per session, and dedup is by state on disk, not by
 the model's memory:
 
-  * No session file -> the question goes out with the prompt, recommending
-    the branch key when the branch has one and typing the id otherwise ("no
-    ticket" is always offered, never recommended: the goal is to identify the
-    ticket). Outside a git work tree there is no branch to infer from, but the
-    question is asked all the same. As long as the file is missing the
-    question repeats (the user dismissed it, or the model skipped it).
+  * No session file, question not asked yet -> the question goes out with the
+    prompt. With a key in the branch name it is an AskUserQuestion box (header
+    `Ticket Jira`) with exactly two options: that key and "Sem ticket"; any
+    other id goes in the box's free-text option. Without a key (no branch, no
+    repo, Cowork) it is asked in plain text, since a box with one option would
+    be the same dead end. A marker (`ticket-asked`) records that it was asked.
 
-  * The answer is persisted BY THIS HOOK, not by the model. The question is
-    asked through AskUserQuestion with a fixed header (`Jira ticket`); the
-    PostToolUse hook on that tool recognises that exact header (nothing else:
-    an unrelated question mentioning Jira is ignored), reads the chosen answer
-    and writes the session file — only while the file does not exist yet, so
-    no later question can rewrite it. Delegating the write to the model was
-    the source of repeated questions: in plan mode it cannot write files at
-    all, and outside plan mode it sometimes just does not. The model only
-    writes the file itself as a fallback when AskUserQuestion is unavailable.
+  * Question already asked, still no answer -> a short prompt (<= 30 chars)
+    holding a key or "sem ticket" IS the answer and is recorded; anything else
+    gets the fixed nudge "O id do ticket não veio. ..." until a valid answer
+    comes. "sem ticket" always unlocks. The first prompt is never read as an
+    answer: a key cited in the work request must not become the ticket.
+
+  * The answer is persisted BY THIS HOOK, never by the model: from the box
+    (PostToolUse on AskUserQuestion, recognised only by its fixed header) or
+    from the typed reply (UserPromptSubmit). Both paths go through
+    `record_ticket`, which writes the session file — only while it does not
+    exist yet, so nothing can rewrite it — prunes old sessions and hands the
+    session to emit-session-context so the first context record goes out.
 
   * Session file present -> a one-line context with the ticket and an
     explicit "do not ask again". Nothing re-asks: not a branch switch, not a
@@ -83,11 +86,23 @@ SESSION_FILE = "jira-ticket"
 # Files the prune may delete: ours plus the context hook's send state
 # (emit-session-context writes them next to the ticket). A file missing from this
 # list keeps its session dir from ever being removed.
-OWNED_FILES = (SESSION_FILE, "branch-key", "context-sent.json")
+ASKED_FILE = "ticket-asked"
+OWNED_FILES = (SESSION_FILE, ASKED_FILE, "branch-key", "context-sent.json")
 # Header the model must give the AskUserQuestion (<= 12 chars); it is how the
 # PostToolUse hook tells the Jira question apart from any other question.
-QUESTION_HEADER = "Jira ticket"
-NO_TICKET_PREFIXES = ("no specific task", "none", "no ticket", "sem ticket", "nenhum")
+QUESTION_HEADER = "Ticket Jira"
+NO_TICKET = "sem ticket"  # the only negative answer, same rule as the Control Tower
+TYPED_MAX = 30  # a typed reply this short is an answer; longer is a work request
+NO_TICKET_LABEL = "Sem ticket"
+QUESTION_BOX = (
+    "Qual é o ticket do Jira deste trabalho? Para outro ticket, use a opção de "
+    "texto livre e digite o id, por exemplo: 'ABC-123'."
+)
+QUESTION_TEXT = (
+    "Qual é o ticket do Jira deste trabalho? Digite o id, por exemplo: 'ABC-123', "
+    "ou responda 'sem ticket'."
+)
+NUDGE = "O id do ticket não veio. Digite o ticket, por exemplo: 'ABC-123', ou responda 'sem ticket'."
 
 
 # --------------------------------------------------------------------------- #
@@ -225,35 +240,41 @@ BLOCK_RULES = (
 )
 
 
-def persist_rules(session_file):
-    return (
-        "Use exactly {} as the AskUserQuestion header: a hook records the answer "
-        "automatically from that question, so do NOT write any file yourself. Only if "
-        "AskUserQuestion is unavailable, ask in plain text and, once answered, write the "
-        "session file {} yourself — create its parent directories if needed — as exactly "
-        "one line with no trailing newline: the chosen key uppercase (e.g. ABC-123), or "
-        "the literal none."
-    ).format(json.dumps(QUESTION_HEADER), json.dumps(str(session_file)))
+NO_WRITE = "A hook records the answer automatically; do NOT write any file yourself."
 
 
 def describe(key):
     return "none (working without a ticket)" if key == "none" else key
 
 
-def ask_unset(bkey, session_file):
-    """Nobody has answered in this session: ask, recommending the branch key
-    when there is one, else typing the id. "No specific task" is always
-    offered but never recommended."""
-    options = []
-    if bkey:
-        options.append("'{} (from branch) (Recommended)'".format(bkey))
-        options.append("'Another ticket id' (the user types it, e.g. ABC-123)")
-    else:
-        options.append("'Another ticket id (Recommended)' (the user types it, e.g. ABC-123)")
-    options.append("'No specific task'")
-    return "{} The Jira ticket for this session is not set. {} which Jira ticket this work belongs to. Options: {}. {} {}".format(
-        PRIORITY, ASK, ", ".join(options), BLOCK_RULES, persist_rules(session_file)
+def ask_box(bkey):
+    """Branch carries a key: a box with exactly the two options that decide."""
+    return (
+        "{} The Jira ticket for this session is not set. Ask the user NOW with the "
+        "AskUserQuestion tool, header exactly {}, question exactly {}, and exactly "
+        "two options: {} and {}. If AskUserQuestion is unavailable, ask the same "
+        "question in plain text. {} {}"
+    ).format(
+        PRIORITY, json.dumps(QUESTION_HEADER), json.dumps(QUESTION_BOX),
+        json.dumps(bkey), json.dumps(NO_TICKET_LABEL), BLOCK_RULES, NO_WRITE,
     )
+
+
+def ask_text():
+    """No key to offer: plain text (a one-option box is the same dead end)."""
+    return (
+        "{} The Jira ticket for this session is not set. Ask the user NOW, in plain "
+        "text (do not use AskUserQuestion), exactly: {} {} {}"
+    ).format(PRIORITY, json.dumps(QUESTION_TEXT), BLOCK_RULES, NO_WRITE)
+
+
+def nudge():
+    """Asked already, and the reply carried no decision."""
+    return (
+        "{} The Jira ticket for this session is still not set: the user's last "
+        "message carried no ticket id. Before anything else, tell the user exactly: "
+        "{} and wait for the reply. {} {}"
+    ).format(PRIORITY, json.dumps(NUDGE), BLOCK_RULES, NO_WRITE)
 
 
 def resolved(session_key):
@@ -279,9 +300,19 @@ def run_prompt(payload):
     session_key = read_key(session_file)
 
     if session_key is None:
-        # Outside a git work tree `branch_key` is simply empty: the question is
-        # asked everywhere, only the recommendation needs a repo.
-        msg = ask_unset(branch_key(cwd), session_file)
+        asked = sdir / ASKED_FILE
+        if asked.exists():
+            prompt = str(payload.get("prompt") or "").strip()
+            key = parse_answer(prompt) if len(prompt) <= TYPED_MAX else None
+            if key is not None:
+                record_ticket(session_file, payload, key)
+                msg = resolved(key)
+            else:
+                msg = nudge()
+        else:
+            write_text(asked, "")
+            bkey = branch_key(cwd)  # empty outside a repo, in Cowork, or without a key
+            msg = ask_box(bkey) if bkey else ask_text()
     else:
         msg = resolved(session_key)
         # Keep the live session out of the prune window.
@@ -349,10 +380,20 @@ def parse_answer(text):
     if match:
         key = match.group(0).upper()
         return key if JIRA_KEY_RE.match(key) else None
-    lowered = raw.lower()
-    if lowered.startswith(NO_TICKET_PREFIXES):
+    if NO_TICKET in raw.lower():
         return "none"
     return None
+
+
+def record_ticket(session_file, payload, key):
+    """The one place a ticket is recorded (box or typed reply): write it, prune
+    old sessions (once per session, since it is written once) and send the first
+    context record."""
+    write_text(session_file, key)
+    root = sessions_root()
+    if root is not None:
+        prune(root)
+    trigger_context(payload)
 
 
 def trigger_context(payload):
@@ -398,11 +439,7 @@ def run_post_tool_use(payload):
         answer = find_answer(str(question.get("question") or ""), payload.get("tool_response"))
         key = parse_answer(answer)
         if key is not None:
-            write_text(session_file, key)
-            root = sessions_root()
-            if root is not None:
-                prune(root)  # once per session: the ticket is recorded only once
-            trigger_context(payload)
+            record_ticket(session_file, payload, key)
         return  # one Jira question per AskUserQuestion call
 
 
