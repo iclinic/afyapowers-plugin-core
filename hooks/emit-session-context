@@ -366,8 +366,6 @@ def ticket_known(session_id):
 
 
 SENT_STATE_FILE = "context-sent.json"   # repo/branch last confirmed by the collector
-SENDING_LOCK_FILE = "context-sending.lock"
-SENDING_LOCK_STALE_S = 30
 
 
 def _plain(value):
@@ -381,27 +379,6 @@ def needs_send(state_path, repo, branch):
     except Exception:
         return True
     return prev.get("repo") != repo or prev.get("branch") != branch
-
-
-def claim_send(lock_path):
-    """Exclusive claim so two triggers firing together (the ticket hook and a
-    prompt) send once. A lock older than SENDING_LOCK_STALE_S is a crashed send
-    and is taken over."""
-    for _ in range(2):
-        try:
-            os.close(os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-            return True
-        except FileExistsError:
-            try:
-                if time.time() - lock_path.stat().st_mtime > SENDING_LOCK_STALE_S:
-                    lock_path.unlink()
-                    continue
-            except Exception:
-                pass
-            return False
-        except Exception:
-            return False
-    return False
 
 
 def save_sent_state(state_path, repo, branch):
@@ -754,16 +731,12 @@ def emit(config, payload):
     sdir = ticket_file.parent if ticket_file else None
     if sdir is None:
         return
-    state_path, lock_path = sdir / SENT_STATE_FILE, sdir / SENDING_LOCK_FILE
-    if not needs_send(state_path, repo, branch) or not claim_send(lock_path):
+    state_path = sdir / SENT_STATE_FILE
+    if not needs_send(state_path, repo, branch):
         return
-    try:
-        _send(config, payload, git, state_path, repo, branch)
-    finally:
-        try:
-            lock_path.unlink()
-        except Exception:
-            pass
+    # No lock: if the ticket hook's trigger and a prompt land together, the
+    # record may go out twice — harmless, the backend counts per session.
+    _send(config, payload, git, state_path, repo, branch)
 
 
 def _send(config, payload, git, state_path, repo, branch):

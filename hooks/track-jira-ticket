@@ -81,7 +81,7 @@ SESSION_FILE = "jira-ticket"
 # Files the prune may delete: ours plus the context hook's send state
 # (emit-session-context writes them next to the ticket). A file missing from this
 # list keeps its session dir from ever being removed.
-OWNED_FILES = (SESSION_FILE, "branch-key", "context-sent.json", "context-sending.lock")
+OWNED_FILES = (SESSION_FILE, "branch-key", "context-sent.json")
 # Header the model must give the AskUserQuestion (<= 12 chars); it is how the
 # PostToolUse hook tells the Jira question apart from any other question.
 QUESTION_HEADER = "Jira ticket"
