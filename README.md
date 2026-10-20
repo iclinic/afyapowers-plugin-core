@@ -105,7 +105,7 @@ Os caminhos com `~/.claude` usam a pasta de `CLAUDE_CONFIG_DIR` quando essa vari
 
 ## Status line
 
-Opcional, global: `/afyapowers-core:statusline` (remover: `/afyapowers-core:statusline remove`). Mostra a marca, o modelo, o uso de contexto, o ticket da sessão, o git, o custo e a duração. Requer Python 3.9+.
+Ligada pela política do console nas contas da Afya; só sai se for removida da política. Fora delas: `/afyapowers-core:statusline` (remover: `/afyapowers-core:statusline remove`). Mostra marca, modelo, contexto, ticket, git, custo e duração. Requer Python 3.9+.
 
 ## Configuração da telemetria
 
@@ -122,7 +122,7 @@ O Claude Code apaga as `OTEL_*` do ambiente dos hooks; por isso o core usa vari�
 ## Diagnóstico de uma máquina sem `session_context`
 
 1. `ls ~/.claude/afyapowers-core/sessions/$(ls -t ~/.claude/afyapowers-core/sessions | head -1)/` — mostra a pasta da sessão mais recente. Sem `jira-ticket`, a pessoa ainda não respondeu à pergunta, e nada é enviado antes disso.
-2. `cat ~/.claude/afyapowers-core/last-send.json` — data, endpoint, status, erro e último sucesso. Erro `no AFYAPOWERS_OTLP_LOGS_ENDPOINT`: a política simnão chegou; reiniciar o Claude Code ou refazer o login.
+2. `cat ~/.claude/afyapowers-core/last-send.json` — data, endpoint, status, erro e último sucesso. Erro `no AFYAPOWERS_OTLP_LOGS_ENDPOINT`: a política não chegou; reiniciar o Claude Code ou refazer o login.
 3. Numa sessão, `! env | grep -c '^AFYAPOWERS_OTLP_LOGS_'` deve mostrar 3.
 
 ## Garantias
