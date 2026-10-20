@@ -1,6 +1,6 @@
 # afyapowers-core
 
-Plugin base da família **afyapowers**. Pergunta e registra o ticket do Jira de cada sessão, envia à telemetria o contexto da sessão (ticket, repositório, branch), injeta a diretiva de idioma pt-BR nas skills afyapowers, gera o histórico das conversas em HTML e oferece uma status line opcional.
+Plugin base da família **afyapowers**. Pergunta e registra o ticket do Jira de cada sessão, envia à telemetria o contexto da sessão (ticket, repositório, branch), injeta a diretiva de idioma pt-BR nas skills afyapowers, gera o histórico das conversas em HTML e mostra uma status line.
 
 ## Onde roda
 
@@ -14,14 +14,6 @@ Plugin base da família **afyapowers**. Pergunta e registra o ticket do Jira de 
 ## Instalação
 
 Distribuído pelo console da Anthropic como plugin obrigatório nas contas da Afya: chega sozinho, sem instalação manual. Requisito: Python 3.9+ no PATH (`python3`).
-
-Para testar uma versão em desenvolvimento, só no terminal:
-
-```
-claude --plugin-dir <pasta deste repositório>
-```
-
-Nessa sessão, a cópia local substitui a do console.
 
 ## Hooks
 
@@ -117,7 +109,13 @@ No bloco `env` da política do Claude Code, no console, em cada conta:
 | `AFYAPOWERS_OTLP_LOGS_HEADERS` | `chave=valor,chave=valor`, o mesmo valor de `OTEL_EXPORTER_OTLP_LOGS_HEADERS` |
 | `AFYAPOWERS_OTLP_LOGS_PROTOCOL` | `http/protobuf` (padrão) ou `http/json` |
 
-O Claude Code apaga as `OTEL_*` do ambiente dos hooks; por isso o core usa variáveis próprias. As variáveis precisam estar na política **antes** de publicar uma versão do core que as lê. Para teste local, as mesmas variáveis funcionam no `.claude/settings.json`; quando a política também as define, vale a política.
+O Claude Code apaga as `OTEL_*` do ambiente dos hooks; por isso o core usa variáveis próprias. As variáveis precisam estar na política **antes** de publicar uma versão do core que as lê.
+
+## Garantias
+
+- Nenhum hook bloqueia a sessão: qualquer erro termina com `exit 0`.
+- Nenhum hook cria `.afyapowers/` no projeto. O estado fica em `~/.claude/afyapowers-core/`, e o histórico vai para `.afyapowers/history/` quando o projeto já tem essa pasta.
+- O envio do evento roda em processo filho. Os outros hooks fazem só operações curtas, com tempo limite.
 
 ## Diagnóstico de uma máquina sem `session_context`
 
@@ -125,11 +123,15 @@ O Claude Code apaga as `OTEL_*` do ambiente dos hooks; por isso o core usa vari�
 2. `cat ~/.claude/afyapowers-core/last-send.json` — data, endpoint, status, erro e último sucesso. Erro `no AFYAPOWERS_OTLP_LOGS_ENDPOINT`: a política não chegou; reiniciar o Claude Code ou refazer o login.
 3. Numa sessão, `! env | grep -c '^AFYAPOWERS_OTLP_LOGS_'` deve mostrar 3.
 
-## Garantias
+## Teste de uma versão em desenvolvimento
 
-- Nenhum hook bloqueia a sessão: qualquer erro termina com `exit 0`.
-- Nenhum hook cria `.afyapowers/` no projeto. O estado fica em `~/.claude/afyapowers-core/`, e o histórico vai para `.afyapowers/history/` quando o projeto já tem essa pasta.
-- O envio do evento roda em processo filho. Os outros hooks fazem só operações curtas, com tempo limite.
+Só no terminal:
+
+```
+claude --plugin-dir <pasta deste repositório>
+```
+
+Nessa sessão, a cópia local substitui a do console. As variáveis `AFYAPOWERS_OTLP_LOGS_*` também funcionam no `.claude/settings.json`; quando a política as define, vale a política.
 
 ## Estrutura
 
