@@ -14,6 +14,7 @@
 - **Aviso de Python ausente:** passa a chegar ao modelo; o formato anterior era descartado pelo Claude Code.
 - **Status line:** mostra a branch, ou `detached`, num repositório sem commits e com HEAD solto.
 - **`jira.key` vazio:** no `session_context`, significa "sem ticket", porque o evento só sai depois da resposta.
+- **Caminho com espaço:** os hooks rodam quando o caminho do plugin tem espaço, como no app desktop do macOS (`~/Library/Application Support/...`). Antes, nenhum hook do core rodava nesse caso.
 - **Nomes:** `otel-context` → `emit-session-context`, `jira-context` → `track-jira-ticket`, `lang-directive` → `enforce-language`; evento `afyapowers-core.git_context` → `afyapowers-core.session_context`.
 
 ### Removido
