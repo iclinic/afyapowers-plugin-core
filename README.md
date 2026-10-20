@@ -1,248 +1,149 @@
 # afyapowers-core
 
-Plugin core da família **afyapowers** para o **Claude Code**, responsável por fornecer contexto de Jira, status line, histórico de conversas em HTML, telemetria OTLP e diretiva de idioma pt-BR.
+Plugin base da família **afyapowers**. Pergunta e registra o ticket do Jira de cada sessão, envia à telemetria o contexto da sessão (ticket, repositório, branch), injeta a diretiva de idioma pt-BR nas skills afyapowers, gera o histórico das conversas em HTML e oferece uma status line opcional.
 
-Funciona de forma independente do workflow de fases do [afyapowers](https://github.com/afya/afyapowers) — instale este plugin mesmo em projetos que não usam o workflow.
+## Onde roda
 
-> **Apenas Claude Code.** Diferente do afyapowers, este plugin não tem distribuições para Cursor, Gemini ou GitHub Copilot.
-
-## Visão geral
-
-| Componente | Evento(s) | O que faz |  
+| Produto | Canais | O que funciona |
 |---|---|---|
-| [`hooks/track-jira-ticket`](#contexto-de-jira) | `SessionStart`, `UserPromptSubmit`, `PostToolUse` (AskUserQuestion) | Confirma o ticket Jira **uma vez por sessão**, grava a resposta e o injeta como contexto de cada prompt |
-| [`hooks/enforce-language`](#diretiva-de-idioma-pt-br) | `PreToolUse` (Skill), `UserPromptExpansion` | Reinjeta a diretiva de idioma pt-BR quando qualquer skill `afyapowers*:` é invocada |
-| [`hooks/render-history`](#histórico-de-conversas) | `SessionEnd` | Renderiza a conversa da sessão em HTML autocontido |
-| [`hooks/emit-session-context`](#telemetria-opentelemetry) | `SessionStart`, `UserPromptSubmit`, `SessionEnd` | Emite log records OTLP com contexto de git/Jira/versão |
-| [`hooks/refresh-plugin-root`](#ponteiro-de-instalação-e-pré-requisitos) | `SessionStart` | Regrava o ponteiro usado pela status line e avisa se o Python está ausente |
-| [`scripts/statusline.py`](#status-line) + `/afyapowers-core:statusline` | — | Status line opt-in: marca afyapowers, modelo, contexto, ticket Jira, git, custo e duração |
+| Claude Code | terminal, extensão de IDE, aba Code do app | tudo |
+| Cowork | app, na máquina | pergunta do ticket em texto, idioma e histórico |
+| Cowork | nuvem | nenhum hook roda |
+| Chat, Office, Claude Tag | todos | nenhum hook roda |
 
-**Requisito de runtime:** Python 3.9+ no PATH (`python3`).
+## Instalação
 
-### Garantias de execução
+Distribuído pelo console da Anthropic como plugin obrigatório nas contas da Afya: chega sozinho, sem instalação manual. Requisito: Python 3.9+ no PATH (`python3`).
 
-Todos os hooks seguem o mesmo contrato:
-
-- **Nunca bloqueiam a sessão.** São observabilidade/enriquecimento de contexto: qualquer erro resulta em `exit 0` silencioso, nunca em prompt travado ou sessão quebrada.
-- **Nunca criam `.afyapowers/`.** A presença desse diretório é o que marca um projeto como afyapowers-enabled, e sua criação é responsabilidade do plugin afyapowers (`/afyapowers:new`). Em projetos sem `.afyapowers/`, os hooks degradam graciosamente: history vai para o diretório global. O estado **por sessão** (ticket Jira confirmado) fica fora do projeto, em `~/.claude/afyapowers-core/sessions/`, e não depende de `.afyapowers/` existir.
-- **Trabalho pesado fora do caminho crítico.** O que envolve git ou rede (telemetria) roda em processo filho destacado; o hook em si retorna em milissegundos.
-
-## Componentes
-
-### Contexto de Jira
-
-`hooks/track-jira-ticket` é o dono do fluxo de ticket Jira. O ticket é **por sessão**, não por projeto: duas sessões do Claude Code abertas na mesma pasta são dois trabalhos distintos, e cada uma grava a própria resposta em
-
-```text
-~/.claude/afyapowers-core/sessions/<session_id>/
-  jira-ticket    # escrito pelo hook (PostToolUse) a partir da resposta do AskUserQuestion: ABC-123 ou o literal none
-```
-
-(`~/.claude` respeita `CLAUDE_CONFIG_DIR`.) O arquivo `jira-ticket` é o que a telemetria e a status line leem — ambas o resolvem pelo `session_id` que já recebem no stdin.
-
-A cada `UserPromptSubmit` o hook:
-
-1. **Lê o arquivo da sessão.**
-2. **Sessão sem resposta** → extrai uma sugestão da branch atual (padrão `ABC-123` no nome da branch, quando há repositório git) e injeta, junto com o prompt, a instrução para o modelo perguntar ao usuário via `AskUserQuestion` como primeira ação do turno, com o header fixo `Jira ticket`. Opção recomendada: a chave da branch, se houver; senão, digitar o id. "Sem ticket" é sempre oferecido, nunca recomendado.
-3. **Sessão resolvida** → injeta só uma linha com o ticket atual e a instrução explícita de **não perguntar de novo** nesta sessão. Troca de branch ou mudança de assunto não re-perguntam: o ticket vale para a sessão inteira.
-
-Quem **grava a resposta é o próprio hook**, no evento `PostToolUse` de `AskUserQuestion`: ele reconhece a pergunta **exclusivamente pelo header `Jira ticket`** (qualquer outra pergunta do agente, mesmo que mencione Jira, é ignorada), lê a opção escolhida (ou o texto digitado) e escreve `jira-ticket` — chave `ABC-123` em maiúsculas ou `none` — **apenas se o arquivo da sessão ainda não existir**; uma resposta já gravada nunca é sobrescrita. Delegar a gravação ao modelo era a causa das perguntas repetidas: em plan mode o modelo não pode gravar arquivos, e fora dele às vezes ignorava a instrução. O modelo só grava o arquivo por conta própria quando `AskUserQuestion` não está disponível.
-
-A deduplicação é por estado em disco, não pela memória do modelo: a pergunta se repete enquanto o arquivo da sessão não existir (o usuário cancelou a pergunta ou o modelo a pulou) e nunca mais depois — sobrevive a `/compact` e a plan mode, e `--resume` reaproveita a resposta. O hook não infere o ticket da branch sozinho: o usuário confirma uma vez por sessão; uma sessão nova pergunta de novo.
-
-Não existe mais ponteiro por projeto: o antigo `.afyapowers/current-jira-ticket` era compartilhado por todas as sessões da pasta, exatamente o que fazia a resposta de uma sessão vazar para a telemetria da outra. Este plugin não o lê nem o grava.
-
-Em `SessionStart` o hook só faz manutenção: cria `sessions/` e remove entradas sem uso há mais de 7 dias (o arquivo da sessão é "tocado" a cada prompt, então uma sessão viva ou retomada nunca expira em uso). Não há registro em `SessionEnd`: `--resume` e `/clear` mantêm a sessão anterior retomável, e os hooks de `SessionEnd` de plugins dividem um orçamento total de 1,5 s.
-
-O hook não toca no projeto (nem `.afyapowers/` nem `.gitignore`). Fora de um repositório git a pergunta é feita do mesmo jeito — só a sugestão a partir da branch precisa de um repositório.
-
-> **Follow-up no afyapowers-dev:** a skill `design` ainda grava `.afyapowers/current-jira-ticket` (e `/new` o cria vazio), que nada mais lê. Para o ticket validado no design refletir na sessão corrente, ela deve passar a gravar o arquivo de sessão cujo caminho o `track-jira-ticket` informa no contexto de cada prompt.
-
-### Diretiva de idioma pt-BR
-
-`hooks/enforce-language` reinjeta a diretiva de idioma da família afyapowers no momento em que ela é mais necessária: quando uma skill `afyapowers*:` é invocada — pelo modelo (`PreToolUse` no tool `Skill`) ou pelo usuário via slash command (`UserPromptExpansion`).
-
-A diretiva instrui o modelo a conversar e escrever todos os artefatos afyapowers em português do Brasil, tratando os templates em inglês dentro das skills como guia de conteúdo (não texto final), mantendo em inglês os termos técnicos convencionais e os identificadores de fase do workflow, e nunca traduzindo código, identificadores ou caminhos de arquivo.
-
-Injetar por skill (em vez de a cada prompt) mantém a diretiva próxima da ação sem custo de tokens em turnos que não usam afyapowers.
-
-### Histórico de conversas
-
-`hooks/render-history` (`SessionEnd`) lê o transcript JSONL da sessão e renderiza **um HTML interativo e autocontido por sessão**, mais um `index.html` regenerado com a lista de sessões. Conversas de subagentes (tool `Agent`) são seguidas recursivamente e renderizadas aninhadas sob a chamada que as criou.
-
-Destino dos arquivos:
-
-- Projetos afyapowers-enabled: `.afyapowers/history/claude/` (ignorado pelo git via `.afyapowers/.gitignore`).
-- Demais projetos: `~/.claude/afyapowers-core/history/<projeto>/claude/` — todo projeto tem histórico, nenhum ganha um `.afyapowers/` que não pediu.
-
-### Status line
-
-Opt-in, instalada **globalmente** (vale para todos os projetos do usuário):
+Para testar uma versão em desenvolvimento, só no terminal:
 
 ```
-/afyapowers-core:statusline
+claude --plugin-dir <pasta deste repositório>
 ```
 
-Mostra no rodapé do Claude Code: a marca afyapowers, modelo e uso de contexto, o ticket Jira confirmado **nesta sessão** (resolvido pelo `session_id`; omitido até o usuário confirmar ou quando trabalha sem ticket), branch/estado do git, custo e duração da sessão.
+Nessa sessão, a cópia local substitui a do console.
 
-Remoção: `/afyapowers-core:statusline remove`. O instalador é idempotente: mescla apenas a chave `statusLine` em `~/.claude/settings.json` e, na remoção, deleta apenas ela — nunca sobrescreve um settings quebrado.
+## Hooks
 
-A entrada `statusLine` resolve o script através do ponteiro `~/.claude/afyapowers-core/plugin-root`, regravado a cada início de sessão pelo hook `refresh-plugin-root` — assim ela sobrevive a upgrades de versão do plugin, que mudam o caminho de instalação.
+Os caminhos com `~/.claude` usam a pasta de `CLAUDE_CONFIG_DIR` quando essa variável está definida, como no Cowork. A exceção é o ponteiro da status line, no hook 5.
 
-### Ponteiro de instalação e pré-requisitos
+| # | Hook | Gatilho | O que faz |
+|---|---|---|---|
+| 1 | `track-jira-ticket` | `UserPromptSubmit`, `PostToolUse` do `AskUserQuestion` | pergunta e grava o ticket da sessão |
+| 2 | `emit-session-context` | `UserPromptSubmit` | envia o contexto da sessão à telemetria |
+| 3 | `enforce-language` | `PreToolUse` do `Skill`, `UserPromptExpansion` | injeta a diretiva de idioma pt-BR nas skills afyapowers |
+| 4 | `render-history` | `SessionEnd` | gera o histórico da conversa em HTML |
+| 5 | `refresh-plugin-root` | `SessionStart` | atualiza o ponteiro da status line |
 
-`hooks/refresh-plugin-root` (`SessionStart`) regrava o ponteiro `~/.claude/afyapowers-core/plugin-root` com o caminho da versão instalada do plugin (é ele que mantém a status line funcionando após upgrades) e emite um aviso não-bloqueante na sessão quando o `python3` não está no PATH — já que todos os demais hooks e a status line são Python.
+### 1. track-jira-ticket — ticket da sessão
 
-## Telemetria (OpenTelemetry)
+**Gatilhos:** `UserPromptSubmit` e `PostToolUse` do `AskUserQuestion`.
 
-O Claude Code já exporta métricas e eventos via OTLP, mas nada dinâmico: `env` em `settings.json` é
-estritamente estático (sem interpolação, sem command substitution) e nenhum hook consegue exportar env
-var de volta para o processo do Claude Code. Ou seja, a branch atual jamais chega em
-`OTEL_RESOURCE_ATTRIBUTES`.
+**O que faz:** garante que cada sessão tenha um ticket do Jira, ou a indicação de que não há ticket.
 
-O hook `emit-session-context` resolve isso emitindo **log records OTLP próprios** para o mesmo coletor, em
-`SessionStart`, `UserPromptSubmit` e `SessionEnd`. Cada record carrega:
+- **Pergunta.** No primeiro prompt da sessão, o hook instrui o modelo a perguntar o ticket:
 
-| Atributo | Exemplo | Observação |
-|---|---|---|
-| `event.name` | `afyapowers-core.session_context` | discrimina nossos records dos nativos |
-| `session.id` | `abc123` | **chave de join** com os eventos `claude_code.*` |
-| `prompt.id` | `550e8400-…` | join exato por prompt; ausente no `SessionStart` |
-| `hook.event` | `UserPromptSubmit` | qual evento originou o record |
-| `afyapowers.version` | `1.0.0` | versão do plugin afyapowers-core que produziu o record; lida do manifesto instalado (fallback: `claude plugin details afyapowers-core`), `null` se indeterminável |
-| `jira.key` | `ABC-123` | ticket confirmado **nesta sessão** (`~/.claude/afyapowers-core/sessions/<session_id>/jira-ticket`); sempre presente, `null` até o usuário confirmar ou quando trabalha sem ticket. Sem fallback para o ponteiro do projeto: sessões simultâneas na mesma pasta não se contaminam |
-| `afyapowers_dev.current_phase` | `implement` | fase atual da feature ativa do afyapowers-dev (`.afyapowers/features/<slug>/state.yaml`); omitido quando não há feature ativa |
-| `<plugin>.version` | `afyapowers_dev.version = 1.8.0` | versão de cada plugin da família afyapowers instalado (`claude plugin list --json`); omitido quando indisponível |
-| `git.branch` | `feat/tela-de-quizzes` | `detached` quando em detached HEAD |
-| `git.repo` | `iclinic/afyapowers` | slug do remote (`origin`, ou o primeiro remote); cai para o nome da pasta local se não houver remote hospedado |
-| `git.commit` | `73f5798` | SHA curto do `HEAD` |
-| `git.dirty` | `true` / `false` | opt-in (ver abaixo) |
+  | Situação | Como a pergunta aparece |
+  |---|---|
+  | A branch tem uma chave no nome, como `feat/DEVEX-90-login` | caixa **Ticket Jira** com duas opções: a chave da branch e **Sem ticket**. Outro ticket vai no campo de texto livre da caixa |
+  | A branch não tem chave, não há repositório, ou é o Cowork | pergunta em texto, no chat |
 
-Os pares de `OTEL_RESOURCE_ATTRIBUTES` (department, cost center, squad) viajam no resource dos nossos
-records também, então filtram igual aos eventos nativos.
+- **Resposta.** Vale uma chave do Jira, como `ABC-123`, ou "sem ticket", escolhida ou digitada na caixa, ou digitada como prompt com até 30 caracteres, depois da pergunta. Se a resposta não trouxer nenhuma das duas, o modelo repete "O id do ticket não veio. Digite o ticket, por exemplo: 'ABC-123', ou responda 'sem ticket'." até vir uma resposta válida.
+- **Depois da resposta.** O ticket fica gravado e não muda mais nessa sessão. No mesmo momento, o hook apaga as pastas de sessões paradas há mais de 7 dias e dispara o envio do contexto da sessão (hook 2). A cada prompt seguinte, o hook informa o ticket ao modelo, que pode usá-lo em commits e pull requests e não pergunta de novo.
 
-> `git.repo` sai do remote justamente porque o nome da pasta local é escolha de cada dev e não
-> identifica repositório numa frota. São extraídos apenas o owner e o repo — nunca o host nem
-> credenciais eventualmente embutidas na URL de clone. Remote que é caminho local do filesystem é
-> ignorado, para não vazar o layout de diretórios do dev.
+**Grava:** em `~/.claude/afyapowers-core/sessions/<session_id>/`:
 
-**Como correlacionar:** no backend, junte nossos records aos nativos por `prompt.id` (exato) ou por
-`session.id` (sessão inteira). Ex.: custo de tokens por branch = `claude_code.token.usage` ⨝
-`event.name = 'afyapowers-core.session_context'` em `prompt.id`.
+- `jira-ticket`: a chave, ou `none` para "sem ticket";
+- `ticket-asked`: indica que a pergunta já foi feita nesta sessão.
 
-**`jira.key` no primeiro record:** o hook dispara junto com o prompt, antes de o modelo perguntar e o
-usuário responder, então o record de `SessionStart` e o do primeiro `UserPromptSubmit` de cada sessão
-saem com `jira.key: null` por construção. Para atribuir a sessão inteira ao ticket, preencha no
-backend com o último valor não nulo da sessão, ex. (SQL/Databricks):
+---
 
-```sql
-last_value(jira.key, true) over (partition by session.id order by time_unix_nano
-                                 rows between unbounded preceding and unbounded following)
-```
+### 2. emit-session-context — contexto na telemetria
 
-### Configuração
+**Gatilhos:** `UserPromptSubmit`, e chamado pelo `track-jira-ticket` ao gravar o ticket.
 
-O hook não tem config própria obrigatória: ele **herda** a configuração OTLP que você já usa. Sempre
-que houver um endpoint de logs resolvível, ele emite — não existe opt-in nem kill switch por env var;
-ele só fica inerte quando faltam os dados para enviar (sem endpoint, ou protocolo `grpc`, que o hook
-não fala). As env vars podem vir do ambiente ou do bloco `env` de qualquer settings que o Claude
-Code carrega, na precedência dele: **remote managed** (`~/.claude/remote-settings.json`, cache das
-managed settings configuradas pelo admin no claude.ai) > managed em disco (`managed-settings.json` +
-drop-ins `managed-settings.d/*.json`) > **ambiente do processo** > projeto local > projeto > usuário.
-Ou seja, as managed settings vencem inclusive uma env var exportada no shell do dev, exatamente como
-o Claude Code faz no startup: nada que um usuário faça em dotfile ou shell redireciona a telemetria da
-organização. O hook lê esses arquivos diretamente porque o `env` das settings **não** é herdado pelo
-subprocesso do hook — numa frota configurada só por remote managed settings, o cache local é a única
-fonte do endpoint. (`~/.claude` respeita `CLAUDE_CONFIG_DIR`.)
+**O que faz:** envia o evento `afyapowers-core.session_context` (log OTLP) quando o ticket fica conhecido e, depois, a cada mudança de repositório ou branch. Prompts sem mudança não enviam nada. O envio roda em processo filho; um envio que falha é repetido no prompt seguinte. Sem destino configurado, não envia nada. É o caso do Cowork: o destino vem das variáveis `AFYAPOWERS_OTLP_LOGS_*`, definidas na política do Claude Code, e o Cowork não carrega essa política nas sessões dele.
 
-Não existe variável do plugin para trocar endpoint, headers ou protocolo: o destino é o da organização,
-definido nas managed settings, e nenhum usuário consegue redirecioná-lo. As únicas variáveis próprias
-são de diagnóstico:
+**Atributos:** `event.name`, `session.id`, `prompt.id`, `hook.event`, `jira.key` (vazio = sem ticket), `git.repo`, `git.branch`, `git.commit`, `host.name` e, com feature ativa do afyapowers-dev, `afyapowers_dev.current_phase`. E-mail e versões dos plugins não vão no evento: vêm da telemetria nativa da mesma sessão, pelo `session.id`.
 
-| Variável | Efeito |
+**Grava:**
+
+- `~/.claude/afyapowers-core/sessions/<session_id>/context-sent.json`: repositório e branch do último envio confirmado;
+- `~/.claude/afyapowers-core/last-send.json`: resultado do último envio.
+
+---
+
+### 3. enforce-language — idioma pt-BR
+
+**Gatilhos:** `PreToolUse` do `Skill` e `UserPromptExpansion`.
+
+**O que faz:** injeta a diretiva de idioma pt-BR quando uma skill `afyapowers*:` é invocada.
+
+**Grava:** nada.
+
+---
+
+### 4. render-history — histórico das conversas
+
+**Gatilhos:** `SessionEnd`.
+
+**O que faz:** gera o histórico da conversa em HTML, um arquivo por sessão e um `index.html`.
+
+**Grava:** em `.afyapowers/history/claude/`, quando o projeto já tem `.afyapowers/`, e acrescenta `history/` ao `.gitignore` dessa pasta; senão, em `~/.claude/afyapowers-core/history/<projeto>/claude/`.
+
+---
+
+### 5. refresh-plugin-root — ponteiro da status line
+
+**Gatilhos:** `SessionStart`.
+
+**O que faz:** registra o caminho da versão instalada do plugin, que a status line usa, e avisa o modelo se o `python3` não estiver no PATH.
+
+**Grava:** `~/.claude/afyapowers-core/plugin-root`.
+
+---
+
+## Status line
+
+Opcional, global: `/afyapowers-core:statusline` (remover: `/afyapowers-core:statusline remove`). Mostra a marca, o modelo, o uso de contexto, o ticket da sessão, o git, o custo e a duração. Requer Python 3.9+.
+
+## Configuração da telemetria
+
+No bloco `env` da política do Claude Code, no console, em cada conta:
+
+| Variável | Valor |
 |---|---|
-| `AFYAPOWERS_CORE_OTEL_GIT_DIRTY` | `1` inclui `git.dirty`. Opt-in porque `git status` varre a árvore inteira e custa segundos em monorepo |
-| `AFYAPOWERS_CORE_OTEL_DEBUG` | `1` grava o que foi enviado (ou por que não) em `.afyapowers/otel-debug.jsonl` |
+| `AFYAPOWERS_OTLP_LOGS_ENDPOINT` | URL completa do endpoint de logs OTLP, usada como está |
+| `AFYAPOWERS_OTLP_LOGS_HEADERS` | `chave=valor,chave=valor`, o mesmo valor de `OTEL_EXPORTER_OTLP_LOGS_HEADERS` |
+| `AFYAPOWERS_OTLP_LOGS_PROTOCOL` | `http/protobuf` (padrão) ou `http/json` |
 
-> **Migração do afyapowers ≤ 1.x:** as variáveis mudaram de prefixo (`AFYAPOWERS_OTEL_*` →
-> `AFYAPOWERS_CORE_OTEL_*`) e o `event.name` mudou de `afyapowers.git_context` para
-> `afyapowers-core.git_context`. Atualize managed settings e queries do backend.
->
-> **Migração 1.1 → 1.2:** `jira.key` manteve nome e formato, mas a semântica mudou: passou a ser o
-> ticket confirmado **na sessão** (antes: `.afyapowers/current-jira-ticket`, compartilhado por todas
-> as sessões da pasta, que este plugin não lê mais) e é `null` até a confirmação, inclusive no
-> primeiro `UserPromptSubmit`. Queries que agregam por ticket devem usar o preenchimento por sessão
-> descrito acima. `AFYAPOWERS_CORE_OTEL_ENABLED` deixou de existir e `CLAUDE_CODE_ENABLE_TELEMETRY`
-> não é mais consultado: o hook emite sempre que houver endpoint configurado. `AFYAPOWERS_CORE_OTEL_ENDPOINT`,
-> `_HEADERS` e `_PROTOCOL` também foram removidas: o destino é sempre o das managed settings, sem
-> override por usuário (uma org que expõe logs só por `grpc` precisa publicar uma rota HTTP).
->
-> **Migração 1.2 → 1.3:** a pergunta do ticket passou a ser feita **uma única vez por sessão**, com a chave
-> da branch como opção recomendada quando existir. Não há mais re-pergunta por troca de branch nem por
-> mudança de assunto, e quem grava `jira-ticket` é o hook (novo registro `PostToolUse` em
-> `AskUserQuestion`), não o modelo — por isso a resposta passa a ser persistida também em plan mode. O
-> arquivo `branch-key` deixou de ser escrito (os antigos são removidos pela manutenção de `SessionStart`).
-> `jira.key` na telemetria não muda.
->
-> **Correção 1.2:** o 1.1.x não lia `~/.claude/remote-settings.json`. Em orgs que distribuem a config
-> OTLP apenas por remote managed settings (sem `managed-settings.json` em disco), o hook não achava
-> endpoint e nenhum `git_context` era emitido — só quem tinha o bloco `env` copiado no próprio
-> `settings.json` aparecia no backend. Atualizar o plugin basta; nenhuma config precisa mudar.
+O Claude Code apaga as `OTEL_*` do ambiente dos hooks; por isso o core usa variáveis próprias. As variáveis precisam estar na política **antes** de publicar uma versão do core que as lê. Para teste local, as mesmas variáveis funcionam no `.claude/settings.json`; quando a política também as define, vale a política.
 
-Ordem de resolução do endpoint: `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` → `OTEL_EXPORTER_OTLP_ENDPOINT` +
-`/v1/logs`. Headers e protocolo seguem a mesma lógica per-signal do
-OTel (`OTEL_EXPORTER_OTLP_LOGS_HEADERS` / `_PROTOCOL` ganham dos genéricos).
+## Diagnóstico de uma máquina sem `session_context`
 
-### Rollout na frota
+1. `ls ~/.claude/afyapowers-core/sessions/$(ls -t ~/.claude/afyapowers-core/sessions | head -1)/` — mostra a pasta da sessão mais recente. Sem `jira-ticket`, a pessoa ainda não respondeu à pergunta, e nada é enviado antes disso.
+2. `cat ~/.claude/afyapowers-core/last-send.json` — data, endpoint, status, erro e último sucesso. Erro `no AFYAPOWERS_OTLP_LOGS_ENDPOINT`: a política não chegou; reiniciar o Claude Code ou refazer o login.
+3. Numa sessão, `! env | grep -c '^AFYAPOWERS_OTLP_LOGS_'` deve mostrar 3.
 
-O bloco `env` abaixo nas **remote managed settings** (claude.ai → Admin Settings → Claude Code →
-Managed settings, planos Team/Enterprise) mais o plugin atualizado cobrem toda a base de devs — sem
-dotfile, sem setting por repositório e sem depender de role: as remote settings valem igual para todo
-usuário autenticado na org, e o Claude Code as cacheia em `~/.claude/remote-settings.json`, que o hook
-lê. A alternativa é o mesmo bloco num arquivo de managed settings em disco
-(`/Library/Application Support/ClaudeCode/managed-settings.json` no macOS, `/etc/claude-code/` no
-Linux), distribuído por MDM:
+## Garantias
 
-```json
-{
-  "env": {
-    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
-    "OTEL_LOGS_EXPORTER": "otlp",
-    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/protobuf",
-    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://collector.exemplo.com.br/v1/logs",
-    "OTEL_EXPORTER_OTLP_LOGS_HEADERS": "Authorization=Bearer TOKEN",
-    "OTEL_RESOURCE_ATTRIBUTES": "department=engineering,cost_center=eng-123",
-    "OTEL_METRICS_INCLUDE_RESOURCE_ATTRIBUTES": "false"
-  }
-}
-```
-
-> Managed settings **remove** env vars conflitantes definidas pelo dev no startup, e o hook segue a
-> mesma regra ao montar sua config. Fixar `OTEL_RESOURCE_ATTRIBUTES` ali é o que você quer para
-> atributos organizacionais, mas inviabiliza qualquer enriquecimento local via wrapper de shell.
-
-**Garantias do hook:** roda no caminho crítico do prompt apenas para resolver config e fazer spawn de
-um filho destacado (~50 ms); git e rede acontecem no filho. Nunca escreve em stdout (em
-`UserPromptSubmit` o stdout do hook seria injetado como contexto no prompt), nunca bloqueia a sessão e
-sai `0` em qualquer erro.
+- Nenhum hook bloqueia a sessão: qualquer erro termina com `exit 0`.
+- Nenhum hook cria `.afyapowers/` no projeto. O estado fica em `~/.claude/afyapowers-core/`, e o histórico vai para `.afyapowers/history/` quando o projeto já tem essa pasta.
+- O envio do evento roda em processo filho. Os outros hooks fazem só operações curtas, com tempo limite.
 
 ## Estrutura
 
 ```text
-.claude-plugin/plugin.json   # Manifesto do plugin
+.claude-plugin/plugin.json   # Manifesto
 hooks/
   hooks.json                 # Registro dos hooks
-  refresh-plugin-root        # Ponteiro da status line + aviso de Python (SessionStart)
-  track-jira-ticket               # Ticket Jira por sessão (SessionStart/UserPromptSubmit/PostToolUse)
-  enforce-language             # Diretiva de idioma pt-BR (PreToolUse/UserPromptExpansion)
-  render-history             # Histórico da conversa em HTML (SessionEnd)
-  emit-session-context               # Telemetria OTLP (SessionStart/UserPromptSubmit/SessionEnd)
-scripts/
-  statusline.py              # Renderizador da status line
-skills/
-  statusline/                # /afyapowers-core:statusline — instala/remove a status line
+  track-jira-ticket          # Ticket da sessão
+  emit-session-context       # Contexto na telemetria
+  enforce-language           # Diretiva de idioma pt-BR
+  render-history             # Histórico em HTML
+  refresh-plugin-root        # Ponteiro da status line
+  session_store.py           # Pastas do core e leitura do ticket, usado pelos hooks e pela status line
+scripts/statusline.py        # Status line
+skills/statusline/           # /afyapowers-core:statusline
+CHANGELOG.md                 # Mudanças por versão
 ```
-
-## Licença
-
-MIT
