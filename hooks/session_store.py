@@ -2,8 +2,11 @@
 
 The single definition of the contract between the hooks: track-jira-ticket
 writes the session's ticket, emit-session-context and the status line read it.
-Every path and the ticket format live here, so a change cannot reach one side
-and miss the other — the failure that would leave the core silently mute.
+The config dir, the session folder and the ticket file and format live here,
+so a change cannot reach one side and miss the other — the failure that would
+leave the core silently mute. Files used by a single hook (last-send.json,
+context-sent.json, ticket-asked) and the status line pointer are defined where
+they are used.
 
 Not a hook: it is not registered in hooks.json. The hooks import it from their
 own folder (Python puts a script's folder on the import path); the status line

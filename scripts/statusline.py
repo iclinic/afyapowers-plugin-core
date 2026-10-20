@@ -12,11 +12,7 @@ changes with the plugin version, the account and the distribution channel).
 Every field is optional: absent segments are dropped, empty lines are not
 printed, and any unexpected error results in silence rather than a
 traceback — a non-zero exit or stderr noise would blank the status line.
-
-No caching for now: the single `git status` subprocess is the only
-non-trivial cost (~10-40ms). If huge repositories ever make this laggy,
-cache its output in a session_id-keyed temp file as the official docs
-suggest.
+The single `git status` subprocess is the only non-trivial cost.
 """
 
 import json
@@ -112,6 +108,12 @@ def seg_git(cwd):
     for line in result.stdout.splitlines():
         if line.startswith("## "):
             branch = line[3:].split("...")[0].strip()
+            # git prints these instead of a plain branch name.
+            for prefix in ("No commits yet on ", "Initial commit on "):
+                if branch.startswith(prefix):
+                    branch = branch[len(prefix):]
+            if branch == "HEAD (no branch)":
+                branch = "detached"
         elif line.startswith("??"):
             modified += 1
         elif len(line) >= 2:

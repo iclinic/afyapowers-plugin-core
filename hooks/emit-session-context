@@ -14,7 +14,7 @@ process, so values like the current git branch can never reach
 the same collector, tagged with `session.id` and `prompt.id` — the standard
 attributes on every native `claude_code.*` event — so the backend can join them.
 
-When it sends (core 1.4): once the session's ticket is known — the ticket hook
+When it sends: once the session's ticket is known — the ticket hook
 calls this one right after recording an answer (a key or "no ticket"), and the
 first prompt of a resumed session that already has one also counts — and then
 only when the repo or the branch changes. Prompts with no change send nothing;
@@ -43,8 +43,8 @@ host. Any error -> exit 0. It must also NEVER write to stdout: on
 Every attempt, including one with no destination, overwrites
 `<config>/afyapowers-core/last-send.json` with its time, endpoint, HTTP status,
 error and the time of the last successful send — the file to read when a
-machine looks mute, since failures are otherwise invisible. No history, no
-rotation, no debug switch.
+machine looks mute, since failures are otherwise invisible. Only the last
+attempt is kept.
 """
 
 import json
@@ -112,8 +112,7 @@ def resolve_config(payload):
     Claude Code strips OTEL_* from hook subprocesses but passes these through,
     already resolved with its own precedence (the policy wins over user and
     project settings), so the process environment is the single source: no
-    settings files, no `remote-settings.json` cache, no OTEL_* — the layered
-    lookup of 1.3 left the hook mute wherever the cache was stale or missing.
+    settings files, no `remote-settings.json` cache, no OTEL_*.
     For a local test, the same variables in user or project settings work.
 
     Where there is no policy (Cowork, or a machine that never received it) the
@@ -498,8 +497,8 @@ def emit(config, payload):
     """
     cwd = config["cwd"]
 
-    git = git_attrs(cwd)
-    repo, branch = _plain(git.get("git.repo")), _plain(git.get("git.branch"))
+    git_info = git_attrs(cwd)
+    repo, branch = _plain(git_info.get("git.repo")), _plain(git_info.get("git.branch"))
     sdir = store.session_dir(payload.get("session_id"))
     if sdir is None:
         return
@@ -508,7 +507,7 @@ def emit(config, payload):
         return
     # No lock: if the ticket hook's trigger and a prompt land together, the
     # record may go out twice — harmless, the backend counts per session.
-    _send(config, payload, git, state_path, repo, branch)
+    _send(config, payload, git_info, state_path, repo, branch)
 
 
 def _session_key(session_id):
@@ -517,7 +516,7 @@ def _session_key(session_id):
     return None if ticket in (None, store.NO_TICKET) else ticket
 
 
-def _send(config, payload, git, state_path, repo, branch):
+def _send(config, payload, git_info, state_path, repo, branch):
     cwd = config["cwd"]
 
     # session.id / prompt.id are the join keys against the native claude_code.*
@@ -530,7 +529,7 @@ def _send(config, payload, git, state_path, repo, branch):
         # The session's answer: the key, or an empty value for "no ticket". Only
         # sent once the ticket is known, so empty never means "not answered".
         "jira.key": _session_key(payload.get("session_id")) or ATTR_NULL,
-        **git,
+        **git_info,
     }
     # Optional, OTel host semconv; omitted (never null) when unresolvable.
     host = hostname()
@@ -551,14 +550,14 @@ def _send(config, payload, git, state_path, repo, branch):
             "application/x-protobuf",
         )
 
-    request = urllib.request.Request(
-        config["endpoint"], data=body, headers={"Content-Type": content_type}
-    )
-    for key, value in config["headers"].items():
-        request.add_header(key, value)
-
     status, error = None, None
     try:
+        # Built inside the try: a malformed endpoint must land in last-send.json.
+        request = urllib.request.Request(
+            config["endpoint"], data=body, headers={"Content-Type": content_type}
+        )
+        for key, value in config["headers"].items():
+            request.add_header(key, value)
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
             status = response.status
     except urllib.error.HTTPError as exc:  # the collector answered, with an error

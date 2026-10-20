@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """afyapowers-core Jira ticket context (UserPromptSubmit + PostToolUse).
 
-The single owner of the Jira ticket flow. Context injected at SessionStart
-arrives before the first prompt and the model routinely ignores it when it
-starts acting (same lesson that moved enforce-language to per-skill injection),
-so the question is injected WITH the user's prompt — the moment the model is
-deciding what to do — and framed as the FIRST action of the turn. Once the
-model has read a file or invoked a skill it is already committed to the
-request, and the question either never comes or arrives too late to tag the
-work.
+The single owner of the Jira ticket flow. The question is injected WITH the
+user's prompt — the moment the model is deciding what to do — and framed as
+the FIRST action of the turn: once the model has read a file or invoked a
+skill it is already committed to the request, and a later question arrives
+too late to tag the work.
 
 State is PER SESSION, not per project. Two Claude Code sessions open in the
 same folder are two different pieces of work, so each one records its own
@@ -19,9 +16,9 @@ answer under the user's Claude config dir:
       ticket-asked  marker: the question went out in this session
 
 `jira-ticket` is what emit-session-context stamps on telemetry and what the status
-line renders — both resolve it by the session id they already receive. There
-is no project-level pointer anymore: a file shared by every session in the
-folder is exactly what let one session's answer leak into another's telemetry.
+line renders — both resolve it by the session id they already receive, through
+session_store.py. Nothing is kept per project: a file shared by every session in
+the folder would let one session's answer leak into another's telemetry.
 
 The question is asked ONCE per session, and dedup is by state on disk, not by
 the model's memory:
@@ -61,8 +58,7 @@ UserPromptSubmit it is injected as context).
 Housekeeping runs when a new session's ticket is recorded: session dirs
 unused for more than 7 days are pruned (the session file is touched on every
 prompt, so a live or recently resumed session never expires while in use).
-There is no SessionStart hook: it had no model turn to act on and only
-duplicated what the first prompt carries.
+This hook does not run at SessionStart: there is no model turn to act on yet.
 """
 
 import json

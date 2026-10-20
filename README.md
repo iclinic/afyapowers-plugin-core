@@ -48,7 +48,7 @@ Os caminhos com `~/.claude` usam a pasta de `CLAUDE_CONFIG_DIR` quando essa vari
   | A branch tem uma chave no nome, como `feat/DEVEX-90-login` | caixa **Ticket Jira** com duas opções: a chave da branch e **Sem ticket**. Outro ticket vai no campo de texto livre da caixa |
   | A branch não tem chave, não há repositório, ou é o Cowork | pergunta em texto, no chat |
 
-- **Resposta.** Vale uma chave do Jira, como `ABC-123`, ou "sem ticket", escolhida ou digitada na caixa, ou digitada como prompt com até 30 caracteres, depois da pergunta. Se a resposta não trouxer nenhuma das duas, o modelo repete "O id do ticket não veio. Digite o ticket, por exemplo: 'ABC-123', ou responda 'sem ticket'." até vir uma resposta válida.
+- **Resposta.** Vale uma chave do Jira, como `ABC-123`, ou "sem ticket", escolhida ou digitada na caixa, ou digitada como prompt com até 30 caracteres, depois da pergunta. A chave pode estar em qualquer ponto da resposta: "é o DEVEX-97" vale como DEVEX-97. Se a resposta não trouxer nenhuma das duas, o modelo repete "O id do ticket não veio. Digite o ticket, por exemplo: 'ABC-123', ou responda 'sem ticket'." até vir uma resposta válida.
 - **Depois da resposta.** O ticket fica gravado e não muda mais nessa sessão. No mesmo momento, o hook apaga as pastas de sessões paradas há mais de 7 dias e dispara o envio do contexto da sessão (hook 2). A cada prompt seguinte, o hook informa o ticket ao modelo, que pode usá-lo em commits e pull requests e não pergunta de novo.
 
 **Grava:** em `~/.claude/afyapowers-core/sessions/<session_id>/`:
@@ -122,7 +122,7 @@ O Claude Code apaga as `OTEL_*` do ambiente dos hooks; por isso o core usa vari�
 ## Diagnóstico de uma máquina sem `session_context`
 
 1. `ls ~/.claude/afyapowers-core/sessions/$(ls -t ~/.claude/afyapowers-core/sessions | head -1)/` — mostra a pasta da sessão mais recente. Sem `jira-ticket`, a pessoa ainda não respondeu à pergunta, e nada é enviado antes disso.
-2. `cat ~/.claude/afyapowers-core/last-send.json` — data, endpoint, status, erro e último sucesso. Erro `no AFYAPOWERS_OTLP_LOGS_ENDPOINT`: a política não chegou; reiniciar o Claude Code ou refazer o login.
+2. `cat ~/.claude/afyapowers-core/last-send.json` — data, endpoint, status, erro e último sucesso. Erro `no AFYAPOWERS_OTLP_LOGS_ENDPOINT`: a política simnão chegou; reiniciar o Claude Code ou refazer o login.
 3. Numa sessão, `! env | grep -c '^AFYAPOWERS_OTLP_LOGS_'` deve mostrar 3.
 
 ## Garantias

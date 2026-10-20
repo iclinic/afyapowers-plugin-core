@@ -30,7 +30,7 @@ try:
 except Exception:
     sys.exit(0)  # a broken module ends the hook in silence, like any other error
 
-# Subfolder kept from the multi-IDE layout so existing history stays in place.
+# History subfolder; `claude` keeps the existing history in place.
 HISTORY_SUBDIR = "claude"
 
 
@@ -479,11 +479,11 @@ def ensure_gitignore(afya_dir):
 # --------------------------------------------------------------------------- #
 
 def resolve_history_dir(cwd):
-    """Pick where logs go. Every session is logged (no active-feature gate).
+    """Pick where logs go. Every session is logged.
 
     - If `<cwd>/.afyapowers/` already exists -> log beside the workflow artifacts and
       keep history out of git. Never create `.afyapowers/` ourselves: its presence is
-      what marks a project as afyapowers-enabled (owned by the afyapowers plugin).
+      what marks a project as afyapowers-enabled (owned by afyapowers-dev).
     - Otherwise -> a global per-project store under the Claude config dir, so plain
       projects are logged without being touched.
     """
