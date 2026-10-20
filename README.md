@@ -7,7 +7,7 @@ Plugin base da família **afyapowers**. Pergunta e registra o ticket do Jira de 
 | Produto | Canais | O que funciona |
 |---|---|---|
 | Claude Code | terminal, extensão de IDE, aba Code do app | tudo |
-| Cowork | app, na máquina | pergunta do ticket em texto, idioma e histórico |
+| Cowork | app, na máquina | pergunta do ticket em texto e idioma |
 | Cowork | nuvem | nenhum hook roda |
 | Chat, Office, Claude Tag | todos | nenhum hook roda |
 

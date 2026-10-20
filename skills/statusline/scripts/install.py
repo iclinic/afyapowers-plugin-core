@@ -19,7 +19,6 @@ Prints `ok=true` on success, `ok=false` + stderr detail on failure.
 import argparse
 import io
 import json
-import os
 import sys
 from pathlib import Path
 

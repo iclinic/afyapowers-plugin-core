@@ -187,7 +187,6 @@ def prune(root):
 # --------------------------------------------------------------------------- #
 
 PRIORITY = "TOP PRIORITY — handle this before anything else in this turn."
-ASK = "Ask the user NOW — use the AskUserQuestion tool when available —"
 BLOCK_RULES = (
     "Ask before you do anything else: no other tool call, no reading or searching "
     "files, no skill invocation, no plan or todo list, and no answer to any part of "
