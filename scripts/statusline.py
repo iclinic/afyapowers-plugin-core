@@ -7,7 +7,7 @@ resolved by `session_id`) + git status, and session cost/duration. Installed int
 `~/.claude/settings.json` by the `/afyapowers-core:statusline` skill,
 which resolves this script through the `~/.claude/afyapowers-core/plugin-root`
 pointer maintained by the refresh-plugin-root hook (the install path
-changes on every plugin version upgrade).
+changes with the plugin version, the account and the distribution channel).
 
 Every field is optional: absent segments are dropped, empty lines are not
 printed, and any unexpected error results in silence rather than a
@@ -21,10 +21,17 @@ suggest.
 
 import json
 import os
-import re
 import subprocess
 import sys
-from pathlib import Path
+
+# The session's ticket comes from hooks/session_store.py, the same module the
+# hooks use. Guarded: if it cannot be imported, only the ticket segment goes.
+sys.dont_write_bytecode = True  # no __pycache__ inside the installed plugin
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hooks"))
+try:
+    import session_store as store
+except Exception:
+    store = None
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -36,7 +43,6 @@ JIRA_BLUE = "\033[38;5;33m"
 
 SEPARATOR = DIM + " │ " + RESET
 
-JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 GIT_TIMEOUT = 1.5
 
 
@@ -77,37 +83,15 @@ def seg_context(data):
     return "%s\U0001f9e0 %d%%%s" % (color, pct, RESET)
 
 
-def session_ticket_file(session_id):
-    """Per-session ticket file maintained by the model under the track-jira-ticket
-    hook's instructions: `<config>/afyapowers-core/sessions/<id>/jira-ticket`.
-    Location and sanitizing mirror hooks/track-jira-ticket and hooks/emit-session-context."""
-    if not session_id:
-        return None
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-    if not base or base.startswith("~"):
-        return None
-    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(session_id))
-    if not safe:
-        return None
-    return Path(base) / "afyapowers-core" / "sessions" / safe / "jira-ticket"
-
-
 def seg_jira(session_id):
     # Per session, not per project: two sessions in the same folder can be on
-    # different tickets. No fallback to `.afyapowers/current-jira-ticket`.
-    path = session_ticket_file(session_id)
-    if path is None:
+    # different tickets. Hidden until answered and when there is no ticket.
+    if store is None:
         return None
-    try:
-        raw = path.read_text(encoding="utf-8").strip()
-    except Exception:
+    key = store.read_ticket(session_id)
+    if key in (None, store.NO_TICKET):
         return None
-    if raw.lower() == "none":
-        return None
-    raw = raw.upper()
-    if not JIRA_KEY_RE.match(raw):
-        return None
-    return "%s\U0001f3af %s%s" % (JIRA_BLUE, raw, RESET)
+    return "%s\U0001f3af %s%s" % (JIRA_BLUE, key, RESET)
 
 
 def seg_git(cwd):

@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/enforce-language claude"
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/enforce-language"
           }
         ]
       }
@@ -59,7 +59,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/enforce-language claude"
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/enforce-language"
           }
         ]
       }
@@ -69,7 +69,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/render-history claude"
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/render-history"
           }
         ]
       }

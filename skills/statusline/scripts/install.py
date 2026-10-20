@@ -76,7 +76,7 @@ def install():
 
 def remove():
     """Delete only the statusLine key. The pointer stays: it is harmless
-    and the session-start hook would recreate it anyway."""
+    and the refresh-plugin-root hook would recreate it anyway."""
     if SETTINGS.is_file():
         settings = load_settings()
         if settings.pop("statusLine", None) is not None:

@@ -74,18 +74,30 @@ import sys
 import time
 from pathlib import Path
 
-JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
-BRANCH_KEY_RE = re.compile(r"[A-Z][A-Z0-9]+-[0-9]+", re.IGNORECASE)
+sys.dont_write_bytecode = True  # no __pycache__ inside the installed plugin
+try:
+    import session_store as store  # hooks/session_store.py: paths + ticket format
+except Exception:
+    sys.exit(0)  # a broken module ends the hook in silence, like any other error
+
+# A Jira key inside a branch name or an answer. Both ends must sit on a word
+# boundary: no letter or digit right before the key, and after the number no
+# letter, no digit and no `.` followed by a digit. That keeps
+# `feat/DEVEX-90-login`, `fix/DC-12465/ad` and a typed "DEVEX-97." but drops
+# `claude/jolly-lovelace-8f488e` (Claude Code worktrees), `release-1.135.0`
+# (versions) and `revert-5e9a3c44` (hashes).
+KEY_IN_TEXT_RE = re.compile(
+    r"(?<![A-Z0-9])[A-Z][A-Z0-9]+-[0-9]+(?![A-Z0-9])(?!\.[0-9])", re.IGNORECASE
+)
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 GIT_TIMEOUT = 2
 PRUNE_AGE_S = 7 * 24 * 3600
 PRUNE_MAX_REMOVALS = 100  # per run, so a long backlog never outlasts the hook timeout
-SESSION_FILE = "jira-ticket"
 ASKED_FILE = "ticket-asked"
 # Header the model must give the AskUserQuestion (<= 12 chars); it is how the
 # PostToolUse hook tells the Jira question apart from any other question.
 QUESTION_HEADER = "Ticket Jira"
-NO_TICKET = "sem ticket"  # the only negative answer, same rule as the Control Tower
+NO_TICKET_ANSWER = "sem ticket"  # the only negative answer, same rule as the Control Tower
 TYPED_MAX = 30  # a typed reply this short is an answer; longer is a work request
 NO_TICKET_LABEL = "Sem ticket"
 QUESTION_BOX = (
@@ -97,52 +109,6 @@ QUESTION_TEXT = (
     "ou responda 'sem ticket'."
 )
 NUDGE = "O id do ticket não veio. Digite o ticket, por exemplo: 'ABC-123', ou responda 'sem ticket'."
-
-
-# --------------------------------------------------------------------------- #
-# Session state location (mirrored in emit-session-context and scripts/statusline.py)
-# --------------------------------------------------------------------------- #
-
-def config_dir():
-    """`${CLAUDE_CONFIG_DIR:-~/.claude}`; None when HOME cannot be resolved
-    (expanduser then returns the literal `~`, which would otherwise create a
-    `~` directory relative to cwd)."""
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-    if not base or base.startswith("~"):
-        return None
-    return Path(base)
-
-
-def sessions_root():
-    base = config_dir()
-    return base / "afyapowers-core" / "sessions" if base else None
-
-
-def sanitize(session_id):
-    return "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(session_id))
-
-
-def session_dir(session_id):
-    root = sessions_root()
-    if root is None or not session_id:
-        return None
-    safe = sanitize(session_id)
-    return root / safe if safe else None
-
-
-def read_key(path):
-    """One-line ticket file -> None (missing, empty or garbage: nobody has
-    answered), the literal `none` (explicitly no ticket) or a validated key."""
-    try:
-        raw = Path(path).read_text(encoding="utf-8").strip()
-    except Exception:
-        return None
-    if not raw:
-        return None
-    if raw.lower() == "none":
-        return "none"
-    raw = raw.upper()
-    return raw if JIRA_KEY_RE.match(raw) else None
 
 
 def write_text(path, text):
@@ -175,8 +141,8 @@ def branch_key(cwd):
     case; empty when the branch has none or HEAD is detached. The match is
     case-insensitive because branches routinely carry the key in lower case
     (`feature/abc-123-...`); the returned key is upper-cased to line up with
-    the recorded ticket, which `read_key` always stores upper-cased."""
-    match = BRANCH_KEY_RE.search(git(cwd, "branch", "--show-current") or "")
+    the recorded ticket, which is always stored upper-cased."""
+    match = KEY_IN_TEXT_RE.search(git(cwd, "branch", "--show-current") or "")
     return match.group(0).upper() if match else ""
 
 
@@ -232,8 +198,14 @@ BLOCK_RULES = (
 NO_WRITE = "A hook records the answer automatically; do NOT write any file yourself."
 
 
+def quoted(text):
+    """A quoted literal for the model, accents kept as is (json.dumps would
+    escape them, and the model could repeat `n\\u00e3o` instead of `não`)."""
+    return json.dumps(text, ensure_ascii=False)
+
+
 def describe(key):
-    return "none (working without a ticket)" if key == "none" else key
+    return "none (working without a ticket)" if key == store.NO_TICKET else key
 
 
 def ask_box(bkey):
@@ -244,8 +216,8 @@ def ask_box(bkey):
         "two options: {} and {}. If AskUserQuestion is unavailable, ask the same "
         "question in plain text. {} {}"
     ).format(
-        PRIORITY, json.dumps(QUESTION_HEADER), json.dumps(QUESTION_BOX),
-        json.dumps(bkey), json.dumps(NO_TICKET_LABEL), BLOCK_RULES, NO_WRITE,
+        PRIORITY, quoted(QUESTION_HEADER), quoted(QUESTION_BOX),
+        quoted(bkey), quoted(NO_TICKET_LABEL), BLOCK_RULES, NO_WRITE,
     )
 
 
@@ -254,7 +226,7 @@ def ask_text():
     return (
         "{} The Jira ticket for this session is not set. Ask the user NOW, in plain "
         "text (do not use AskUserQuestion), exactly: {} {} {}"
-    ).format(PRIORITY, json.dumps(QUESTION_TEXT), BLOCK_RULES, NO_WRITE)
+    ).format(PRIORITY, quoted(QUESTION_TEXT), BLOCK_RULES, NO_WRITE)
 
 
 def nudge():
@@ -263,7 +235,7 @@ def nudge():
         "{} The Jira ticket for this session is still not set: the user's last "
         "message carried no ticket id. Before anything else, tell the user exactly: "
         "{} and wait for the reply. {} {}"
-    ).format(PRIORITY, json.dumps(NUDGE), BLOCK_RULES, NO_WRITE)
+    ).format(PRIORITY, quoted(NUDGE), BLOCK_RULES, NO_WRITE)
 
 
 def resolved(session_key):
@@ -282,11 +254,11 @@ def run_prompt(payload):
     if not session_id:
         return  # without a session there is nothing to attach the ticket to
 
-    sdir = session_dir(session_id)
-    if sdir is None:
+    session_file = store.ticket_file(session_id)
+    if session_file is None:
         return
-    session_file = sdir / SESSION_FILE
-    session_key = read_key(session_file)
+    sdir = session_file.parent
+    session_key = store.read_ticket(session_id)
 
     if session_key is None:
         asked = sdir / ASKED_FILE
@@ -347,7 +319,7 @@ def find_answer(question_text, tool_response):
     if isinstance(text, list):  # content blocks
         text = " ".join(str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in text)
     text = str(text)
-    match = re.search(re.escape(json.dumps(question_text)) + r'\s*=\s*"((?:[^"\\]|\\.)*)"', text)
+    match = re.search(re.escape(quoted(question_text)) + r'\s*=\s*"((?:[^"\\]|\\.)*)"', text)
     if match:
         try:
             return json.loads('"' + match.group(1) + '"')
@@ -358,19 +330,18 @@ def find_answer(question_text, tool_response):
 
 def parse_answer(text):
     """Chosen label or free text -> validated key, `none`, or None when the
-    answer carries no decision (e.g. 'Another ticket id' picked without an id:
-    the question will simply come back with the next prompt)."""
+    answer carries no decision (neither a key nor "sem ticket": the nudge comes
+    back with the next prompt)."""
     if text is None:
         return None
     raw = str(text).strip()
     if not raw:
         return None
-    match = BRANCH_KEY_RE.search(raw)
+    match = KEY_IN_TEXT_RE.search(raw)
     if match:
-        key = match.group(0).upper()
-        return key if JIRA_KEY_RE.match(key) else None
-    if NO_TICKET in raw.lower():
-        return "none"
+        return match.group(0).upper()
+    if NO_TICKET_ANSWER in raw.lower():
+        return store.NO_TICKET
     return None
 
 
@@ -379,7 +350,7 @@ def record_ticket(session_file, payload, key):
     old sessions (once per session, since it is written once) and send the first
     context record."""
     write_text(session_file, key)
-    root = sessions_root()
+    root = store.sessions_root()
     if root is not None:
         prune(root)
     trigger_context(payload)
@@ -412,11 +383,10 @@ def trigger_context(payload):
 
 
 def run_post_tool_use(payload):
-    sdir = session_dir(payload.get("session_id"))
-    if sdir is None:
+    session_file = store.ticket_file(payload.get("session_id"))
+    if session_file is None:
         return
-    session_file = sdir / SESSION_FILE
-    if read_key(session_file) is not None:
+    if store.read_ticket(payload.get("session_id")) is not None:
         return  # asked once per session: an existing answer is never rewritten
     tool_input = payload.get("tool_input") or {}
     questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
@@ -438,10 +408,7 @@ def main():
         payload = json.loads(raw) if raw.strip() else {}
         if not isinstance(payload, dict):
             payload = {}
-        event = payload.get("hook_event_name")
-        if event == "SessionStart":
-            return  # not registered there anymore; never act on it
-        if event == "PostToolUse":
+        if payload.get("hook_event_name") == "PostToolUse":
             if payload.get("tool_name") == "AskUserQuestion":
                 run_post_tool_use(payload)
         else:

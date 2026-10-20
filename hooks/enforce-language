@@ -1,30 +1,19 @@
 #!/usr/bin/env python3
-"""afyapowers language directive re-injector.
+"""afyapowers language directive injector.
 
-Re-injects the pt-BR language directive whenever an afyapowers skill is invoked,
-complementing the once-per-session injection done by `session-start`. This keeps
-pt-BR enforcement close to the action when a skill (which may carry English message
-templates) runs, without the per-turn token cost of firing on every prompt.
+Injects the pt-BR language directive whenever an afyapowers skill is invoked,
+close to the action — skills may carry English message templates — without the
+per-turn token cost of firing on every prompt. The core injects it nowhere else.
 
-Agent-aware: the host agent name is passed as argv[1] (same pattern as
-`render-history`). Different agents surface a "skill invocation" through different
-hook events, and expect different stdout shapes, so this script branches on the
-agent + payload:
+Two Claude Code events surface a skill invocation:
 
-  - claude, PreToolUse: fires on the `Skill` tool. Matches when
-    `tool_input.skill` matches `afyapowers*:` — any afyapowers-family plugin
-    (afyapowers, afyapowers-core, ...) — model-invoked skills.
-  - claude, UserPromptExpansion: fires on slash-command expansion. Matches when
-    `command_name` matches `afyapowers*:` (user-typed `/afyapowers...:...`).
-  - gemini, BeforeTool: fires on the `activate_skill` tool, which the agent calls
-    for every skill. The directive is idempotent, so we inject on any activation.
+  - PreToolUse on the `Skill` tool: matches when `tool_input.skill` starts with
+    `afyapowers*:` — any afyapowers-family plugin — for model-invoked skills.
+  - UserPromptExpansion: matches when `command_name` starts with
+    `afyapowers*:`, for user-typed `/afyapowers...:...` commands.
 
-Copilot and Cursor have no hook that can observe a skill invocation (skills
-auto-load with no matchable tool call), so they rely on `session-start` only and
-never wire this script.
-
-Contract: observability/augmentation only. Must NEVER block. On no-match, bad
-input, or any error -> exit 0 with no output.
+Contract: augmentation only. Must NEVER block. On no-match, bad input, or any
+error -> exit 0 with no output.
 """
 
 import sys
@@ -35,9 +24,8 @@ import re
 # `afyapowers-core:...`, and future `afyapowers-*` packages.
 AFYA_PREFIX_RE = re.compile(r"^afyapowers[^:]*:")
 
-# Single source of truth for the directive text. Kept in sync with the (shorter)
-# SessionStart variant in `session-start`. Technical/product terms and workflow
-# phase identifiers stay in English; code/identifiers/paths are never translated.
+# The directive text. Technical/product terms and workflow phase identifiers stay
+# in English; code/identifiers/paths are never translated.
 DIRECTIVE = (
     "Idioma / Language: Fale com o usuário em português do Brasil (pt-BR) por padrão. "
     "Se o usuário escrever em outro idioma, espelhe o idioma dele na conversa. "
@@ -66,8 +54,6 @@ def emit_context(event_name):
 
 
 def main():
-    agent = sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip() else ""
-
     raw = sys.stdin.read()
     try:
         data = json.loads(raw) if raw.strip() else {}
@@ -76,33 +62,17 @@ def main():
     if not isinstance(data, dict):
         return
 
-    tool_name = data.get("tool_name")
-    tool_input = data.get("tool_input") or {}
-    if not isinstance(tool_input, dict):
-        tool_input = {}
+    # Model-invoked skill via the Skill tool (PreToolUse).
+    if data.get("tool_name") == "Skill":
+        tool_input = data.get("tool_input")
+        skill = str(tool_input.get("skill", "")) if isinstance(tool_input, dict) else ""
+        if AFYA_PREFIX_RE.match(skill):
+            emit_context("PreToolUse")
+        return
+    # User-typed slash command (UserPromptExpansion).
     command_name = data.get("command_name")
-
-    if agent == "claude":
-        # Model-invoked skill via the Skill tool (PreToolUse).
-        if tool_name == "Skill":
-            skill = str(tool_input.get("skill", ""))
-            if AFYA_PREFIX_RE.match(skill):
-                emit_context("PreToolUse")
-            return
-        # User-typed slash command (UserPromptExpansion).
-        if command_name and AFYA_PREFIX_RE.match(str(command_name)):
-            emit_context("UserPromptExpansion")
-            return
-        return
-
-    if agent == "gemini":
-        # Every skill the Gemini agent runs goes through the activate_skill tool.
-        if tool_name == "activate_skill":
-            emit_context("BeforeTool")
-        return
-
-    # Unknown / unsupported agent (copilot, cursor): rely on session-start.
-    return
+    if command_name and AFYA_PREFIX_RE.match(str(command_name)):
+        emit_context("UserPromptExpansion")
 
 
 if __name__ == "__main__":
