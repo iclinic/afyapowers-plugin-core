@@ -266,18 +266,7 @@ def hostname():
 # --------------------------------------------------------------------------- #
 
 def git(cwd, *args):
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, *args],
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
+    return store.git(cwd, *args, timeout=GIT_TIMEOUT)
 
 
 # Path segments that hosting providers inject into clone URLs and that carry no

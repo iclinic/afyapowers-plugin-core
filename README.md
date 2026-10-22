@@ -144,7 +144,7 @@ hooks/
   enforce-language           # Diretiva de idioma pt-BR
   render-history             # Histórico em HTML
   refresh-plugin-root        # Ponteiro da status line
-  session_store.py           # Pastas do core e leitura do ticket, usado pelos hooks e pela status line
+  session_store.py           # Pastas do core, ticket, formato da chave e helper de git; usado pelos hooks e pela status line
 scripts/statusline.py        # Status line
 skills/statusline/           # /afyapowers-core:statusline
 CHANGELOG.md                 # Mudanças por versão

@@ -76,15 +76,6 @@ try:
 except Exception:
     sys.exit(0)  # a broken module ends the hook in silence, like any other error
 
-# A Jira key inside a branch name or an answer. Both ends must sit on a word
-# boundary: no letter or digit right before the key, and after the number no
-# letter, no digit and no `.` followed by a digit. That keeps
-# `feat/DEVEX-90-login`, `fix/DC-12465/ad` and a typed "DEVEX-97." but drops
-# `claude/jolly-lovelace-8f488e` (Claude Code worktrees), `release-1.135.0`
-# (versions) and `revert-5e9a3c44` (hashes).
-KEY_IN_TEXT_RE = re.compile(
-    r"(?<![A-Z0-9])[A-Z][A-Z0-9]+-[0-9]+(?![A-Z0-9])(?!\.[0-9])", re.IGNORECASE
-)
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 GIT_TIMEOUT = 2
 PRUNE_AGE_S = 7 * 24 * 3600
@@ -119,26 +110,14 @@ def write_text(path, text):
 # Git
 # --------------------------------------------------------------------------- #
 
-def git(cwd, *args):
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, *args],
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT,
-        )
-    except Exception:
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
-
-
 def branch_key(cwd):
     """First `ABC-123`-shaped token in the branch name, normalized to upper
     case; empty when the branch has none or HEAD is detached. The match is
     case-insensitive because branches routinely carry the key in lower case
     (`feature/abc-123-...`); the returned key is upper-cased to line up with
     the recorded ticket, which is always stored upper-cased."""
-    match = KEY_IN_TEXT_RE.search(git(cwd, "branch", "--show-current") or "")
+    branch = store.git(cwd, "branch", "--show-current", timeout=GIT_TIMEOUT)
+    match = store.KEY_IN_TEXT_RE.search(branch or "")
     return match.group(0).upper() if match else ""
 
 
@@ -332,7 +311,7 @@ def parse_answer(text):
     raw = str(text).strip()
     if not raw:
         return None
-    match = KEY_IN_TEXT_RE.search(raw)
+    match = store.KEY_IN_TEXT_RE.search(raw)
     if match:
         return match.group(0).upper()
     if NO_TICKET_ANSWER in raw.lower():

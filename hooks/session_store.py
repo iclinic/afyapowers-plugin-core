@@ -1,10 +1,12 @@
-"""Where afyapowers-core keeps its state, and how a session's ticket is read.
+"""Where afyapowers-core keeps its state, how a session's ticket is read, and
+the helpers the hooks share.
 
 The single definition of the contract between the hooks: track-jira-ticket
 writes the session's ticket, emit-session-context and the status line read it.
-The config dir, the session folder and the ticket file and format live here,
-so a change cannot reach one side and miss the other — the failure that would
-leave the core silently mute. Files used by a single hook (last-send.json,
+The config dir, the session folder, the ticket file and the key format live
+here, so a change cannot reach one side and miss the other — the failure that
+would leave the core silently mute. The git helper lives here too, so its
+error handling is one copy. Files used by a single hook (last-send.json,
 context-sent.json, ticket-asked) and the status line pointer are defined where
 they are used.
 
@@ -24,9 +26,22 @@ broken module ends the hook in silence like any other error.
 
 import os
 import re
+import subprocess
 from pathlib import Path
 
-JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+# The key format, in one place: the recorded ticket must match it whole, and
+# KEY_IN_TEXT_RE finds it inside a branch name or an answer. ASCII only, so a
+# key found in text always passes JIRA_KEY_RE once upper-cased.
+_KEY = r"[A-Z][A-Z0-9]+-[0-9]+"
+JIRA_KEY_RE = re.compile(rf"^{_KEY}$", re.ASCII)
+# Both ends must sit on a word boundary: no letter or digit right before the
+# key, and after the number no letter, no digit and no `.` followed by a digit.
+# That keeps `feat/DEVEX-90-login`, `fix/DC-12465/ad` and a typed "DEVEX-97."
+# but drops `claude/jolly-lovelace-8f488e` (Claude Code worktrees),
+# `release-1.135.0` (versions) and `revert-5e9a3c44` (hashes).
+KEY_IN_TEXT_RE = re.compile(
+    rf"(?<![A-Z0-9]){_KEY}(?![A-Z0-9])(?!\.[0-9])", re.IGNORECASE | re.ASCII
+)
 TICKET_FILE = "jira-ticket"
 NO_TICKET = "none"
 
@@ -86,3 +101,20 @@ def read_ticket(session_id):
         return NO_TICKET
     raw = raw.upper()
     return raw if JIRA_KEY_RE.match(raw) else None
+
+
+def git(cwd, *args, timeout):
+    """`git -C cwd args...` stdout, stripped; None on failure, timeout or empty
+    output. Each caller passes the timeout its hook can afford."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
