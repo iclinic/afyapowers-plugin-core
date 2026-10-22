@@ -13,7 +13,7 @@
 - **Chave do Jira:** só é reconhecida com o número fechando a palavra. Branches como `claude/jolly-lovelace-8f488e`, `release-1.135.0` e `revert-5e9a3c44` deixam de sugerir uma chave falsa.
 - **Aviso de Python ausente:** passa a chegar ao modelo; o formato anterior era descartado pelo Claude Code.
 - **Status line:** mostra a branch, ou `detached`, num repositório sem commits e com HEAD solto.
-- **`jira.key` vazio:** no `session_context`, significa "sem ticket", porque o evento só sai depois da resposta.
+- **`jira.key` vazio (`""`):** no `session_context`, é uma string vazia e significa "sem ticket", porque o evento só sai depois da resposta.
 - **Caminho com espaço:** os hooks rodam quando o caminho do plugin tem espaço, como no app desktop do macOS (`~/Library/Application Support/...`). Antes, nenhum hook do core rodava nesse caso.
 - **Nomes:** `otel-context` → `emit-session-context`, `jira-context` → `track-jira-ticket`, `lang-directive` → `enforce-language`; evento `afyapowers-core.git_context` → `afyapowers-core.session_context`.
 

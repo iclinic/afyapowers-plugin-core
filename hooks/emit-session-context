@@ -76,6 +76,9 @@ SEVERITY_INFO = 9  # SEVERITY_NUMBER_INFO
 # Explicit null for an attribute: encoded as an empty AnyValue (ValueTypeEmpty
 # on the collector side), unlike None/"" which drop the attribute entirely.
 ATTR_NULL = object()
+# Explicit empty string for an attribute: sent as string_value "" (set, but
+# empty), unlike None/"" which drop the attribute entirely.
+ATTR_EMPTY = object()
 
 
 # --------------------------------------------------------------------------- #
@@ -408,11 +411,14 @@ def _pb_key_values(field, mapping):
     """repeated KeyValue { key = 1; AnyValue value = 2 { string_value = 1 } }
 
     ATTR_NULL encodes as an empty AnyValue (no oneof field set) — the OTLP
-    representation of null; None/"" drop the attribute entirely."""
+    representation of null; ATTR_EMPTY as string_value ""; None/"" drop the
+    attribute entirely."""
     out = b""
     for key, value in mapping.items():
         if value is ATTR_NULL:
             any_value = b""
+        elif value is ATTR_EMPTY:
+            any_value = _pb_string(1, "")
         elif value in (None, ""):
             continue
         else:
@@ -446,11 +452,14 @@ def encode_protobuf(resource, attrs, time_ns):
 
 def _json_attributes(mapping):
     """ATTR_NULL encodes as an empty AnyValue ({}) — the OTLP representation
-    of null; None/"" drop the attribute entirely."""
+    of null; ATTR_EMPTY as {"stringValue": ""}; None/"" drop the attribute
+    entirely."""
     out = []
     for k, v in mapping.items():
         if v is ATTR_NULL:
             out.append({"key": k, "value": {}})
+        elif v is ATTR_EMPTY:
+            out.append({"key": k, "value": {"stringValue": ""}})
         elif v not in (None, ""):
             out.append({"key": k, "value": {"stringValue": str(v)}})
     return out
@@ -511,9 +520,9 @@ def emit(config, payload):
 
 
 def _session_key(session_id):
-    """The recorded key, or None for "no ticket" (sent as an empty value)."""
+    """The recorded key, or ATTR_EMPTY for "no ticket" (sent as "")."""
     ticket = store.read_ticket(session_id)
-    return None if ticket in (None, store.NO_TICKET) else ticket
+    return ATTR_EMPTY if ticket in (None, store.NO_TICKET) else ticket
 
 
 def _send(config, payload, git_info, state_path, repo, branch):
@@ -526,9 +535,9 @@ def _send(config, payload, git_info, state_path, repo, branch):
         "session.id": payload.get("session_id") or ATTR_NULL,
         "prompt.id": payload.get("prompt_id") or ATTR_NULL,
         "hook.event": payload.get("hook_event_name") or ATTR_NULL,
-        # The session's answer: the key, or an empty value for "no ticket". Only
-        # sent once the ticket is known, so empty never means "not answered".
-        "jira.key": _session_key(payload.get("session_id")) or ATTR_NULL,
+        # The session's answer: the key, or "" for "no ticket". Only sent once
+        # the ticket is known, so empty never means "not answered".
+        "jira.key": _session_key(payload.get("session_id")),
         **git_info,
     }
     # Optional, OTel host semconv; omitted (never null) when unresolvable.

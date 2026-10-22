@@ -56,7 +56,7 @@ Os caminhos com `~/.claude` usam a pasta de `CLAUDE_CONFIG_DIR` quando essa vari
 
 **O que faz:** envia o evento `afyapowers-core.session_context` (log OTLP) quando o ticket fica conhecido e, depois, a cada mudança de repositório ou branch. Prompts sem mudança não enviam nada. O envio roda em processo filho; um envio que falha é repetido no prompt seguinte. Sem destino configurado, não envia nada. É o caso do Cowork: o destino vem das variáveis `AFYAPOWERS_OTLP_LOGS_*`, definidas na política do Claude Code, e o Cowork não carrega essa política nas sessões dele.
 
-**Atributos:** `event.name`, `session.id`, `prompt.id`, `hook.event`, `jira.key` (vazio = sem ticket), `git.repo`, `git.branch`, `git.commit`, `host.name` e, com feature ativa do afyapowers-dev, `afyapowers_dev.current_phase`. E-mail e versões dos plugins não vão no evento: vêm da telemetria nativa da mesma sessão, pelo `session.id`.
+**Atributos:** `event.name`, `session.id`, `prompt.id`, `hook.event`, `jira.key` (string vazia `""` = sem ticket), `git.repo`, `git.branch`, `git.commit`, `host.name` e, com feature ativa do afyapowers-dev, `afyapowers_dev.current_phase`. E-mail e versões dos plugins não vão no evento: vêm da telemetria nativa da mesma sessão, pelo `session.id`.
 
 **Grava:**
 
