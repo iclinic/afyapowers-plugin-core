@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""afyapowers-core Jira ticket context (UserPromptSubmit + PostToolUse).
+
+The single owner of the Jira ticket flow. The question is injected WITH the
+user's prompt — the moment the model is deciding what to do — and framed as
+the FIRST action of the turn: once the model has read a file or invoked a
+skill it is already committed to the request, and a later question arrives
+too late to tag the work.
+
+State is PER SESSION, not per project. Two Claude Code sessions open in the
+same folder are two different pieces of work, so each one records its own
+answer under the user's Claude config dir:
+
+    <config>/afyapowers-core/sessions/<session_id>/
+      jira-ticket   written by this hook: `ABC-123` or the literal `none`
+      ticket-asked  marker: the question went out in this session
+
+`jira-ticket` is what emit-session-context stamps on telemetry and what the status
+line renders — both resolve it by the session id they already receive, through
+session_store.py. Nothing is kept per project: a file shared by every session in
+the folder would let one session's answer leak into another's telemetry.
+
+The question is asked ONCE per session, and dedup is by state on disk, not by
+the model's memory:
+
+  * No session file, question not asked yet -> the question goes out with the
+    prompt. With a key in the branch name it is an AskUserQuestion box (header
+    `Ticket Jira`) with exactly two options: that key and "Sem ticket"; any
+    other id goes in the box's free-text option. Without a key (no branch, no
+    repo, Cowork) it is asked in plain text, since a box with one option would
+    be the same dead end. A marker (`ticket-asked`) records that it was asked.
+
+  * Question already asked, still no answer -> a short prompt (<= 30 chars)
+    holding a key or "sem ticket" IS the answer and is recorded; anything else
+    gets the fixed nudge "O id do ticket não veio. ..." until a valid answer
+    comes. "sem ticket" always unlocks. The first prompt is never read as an
+    answer: a key cited in the work request must not become the ticket.
+
+  * The answer is persisted BY THIS HOOK, never by the model: from the box
+    (PostToolUse on AskUserQuestion, recognised only by its fixed header) or
+    from the typed reply (UserPromptSubmit). Both paths go through
+    `record_ticket`, which writes the session file — only while it does not
+    exist yet, so nothing can rewrite it — prunes old sessions and hands the
+    session to emit-session-context so the first context record goes out.
+
+  * Session file present -> a one-line context with the ticket and an
+    explicit "do not ask again". Nothing re-asks: not a branch switch, not a
+    change of subject. The ticket holds for the whole session; a new session
+    starts from scratch. Survives `/compact`, and `--resume` inside the prune
+    window does not re-ask.
+
+Never touches the project: all state lives under the Claude config dir, so
+`.afyapowers/` is neither created nor required (its presence marks a project
+as afyapowers-enabled — owned by afyapowers-dev). Never blocks: any error ->
+exit 0, and nothing but the expected JSON is ever written to stdout (on
+UserPromptSubmit it is injected as context).
+
+Housekeeping runs when a new session's ticket is recorded: session dirs
+unused for more than 7 days are pruned (the session file is touched on every
+prompt, so a live or recently resumed session never expires while in use).
+This hook does not run at SessionStart: there is no model turn to act on yet.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # no __pycache__ inside the installed plugin
+try:
+    import session_store as store  # hooks/session_store.py: paths + ticket format
+except Exception:
+    sys.exit(0)  # a broken module ends the hook in silence, like any other error
+
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+GIT_TIMEOUT = 2
+PRUNE_AGE_S = 7 * 24 * 3600
+PRUNE_MAX_REMOVALS = 100  # per run, so a long backlog never outlasts the hook timeout
+ASKED_FILE = "ticket-asked"
+# Header the model must give the AskUserQuestion (<= 12 chars); it is how the
+# PostToolUse hook tells the Jira question apart from any other question.
+QUESTION_HEADER = "Ticket Jira"
+NO_TICKET_ANSWER = "sem ticket"  # the only negative answer, same rule as the Control Tower
+TYPED_MAX = 30  # a typed reply this short is an answer; longer is a work request
+NO_TICKET_LABEL = "Sem ticket"
+QUESTION_BOX = (
+    "Qual é o ticket do Jira deste trabalho? Para outro ticket, use a opção de "
+    "texto livre e digite o id, por exemplo: 'ABC-123'."
+)
+QUESTION_TEXT = (
+    "Qual é o ticket do Jira deste trabalho? Digite o id, por exemplo: 'ABC-123', "
+    "ou responda 'sem ticket'."
+)
+NUDGE = "O id do ticket não veio. Digite o ticket, por exemplo: 'ABC-123', ou responda 'sem ticket'."
+
+
+def write_text(path, text):
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Git
+# --------------------------------------------------------------------------- #
+
+def branch_key(cwd):
+    """First `ABC-123`-shaped token in the branch name, normalized to upper
+    case; empty when the branch has none or HEAD is detached. The match is
+    case-insensitive because branches routinely carry the key in lower case
+    (`feature/abc-123-...`); the returned key is upper-cased to line up with
+    the recorded ticket, which is always stored upper-cased."""
+    branch = store.git(cwd, "branch", "--show-current", timeout=GIT_TIMEOUT)
+    match = store.KEY_IN_TEXT_RE.search(branch or "")
+    return match.group(0).upper() if match else ""
+
+
+# --------------------------------------------------------------------------- #
+# Housekeeping (on a new session's first recorded ticket)
+# --------------------------------------------------------------------------- #
+
+def prune(root):
+    """Remove whole session dirs (`sessions/<id>/`, created only by the core)
+    whose newest file is older than PRUNE_AGE_S. No list of known files: any
+    file inside counts for the age and goes with the dir. Skips symlinks and
+    names we could not have created; at most PRUNE_MAX_REMOVALS per run; every
+    failure is ignored. Never touches `sessions/` itself or anything above it."""
+    now = time.time()
+    removed = 0
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        if removed >= PRUNE_MAX_REMOVALS:
+            return
+        try:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            if not SAFE_NAME_RE.match(entry.name):
+                continue
+            newest = os.lstat(entry.path).st_mtime
+            with os.scandir(entry.path) as files:
+                for f in files:
+                    newest = max(newest, f.stat(follow_symlinks=False).st_mtime)
+            if now - newest < PRUNE_AGE_S:
+                continue
+            shutil.rmtree(entry.path)
+            removed += 1
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# UserPromptSubmit: the question / the one-line context
+# --------------------------------------------------------------------------- #
+
+PRIORITY = "TOP PRIORITY — handle this before anything else in this turn."
+BLOCK_RULES = (
+    "Ask before you do anything else: no other tool call, no reading or searching "
+    "files, no skill invocation, no plan or todo list, and no answer to any part of "
+    "the request until the user has answered. Do not start the work and ask afterwards."
+)
+
+
+NO_WRITE = "A hook records the answer automatically; do NOT write any file yourself."
+
+
+def quoted(text):
+    """A quoted literal for the model, accents kept as is (json.dumps would
+    escape them, and the model could repeat `n\\u00e3o` instead of `não`)."""
+    return json.dumps(text, ensure_ascii=False)
+
+
+def describe(key):
+    return "none (working without a ticket)" if key == store.NO_TICKET else key
+
+
+def ask_box(bkey):
+    """Branch carries a key: a box with exactly the two options that decide."""
+    return (
+        "{} The Jira ticket for this session is not set. Ask the user NOW with the "
+        "AskUserQuestion tool, header exactly {}, question exactly {}, and exactly "
+        "two options: {} and {}. If AskUserQuestion is unavailable, ask the same "
+        "question in plain text. {} {}"
+    ).format(
+        PRIORITY, quoted(QUESTION_HEADER), quoted(QUESTION_BOX),
+        quoted(bkey), quoted(NO_TICKET_LABEL), BLOCK_RULES, NO_WRITE,
+    )
+
+
+def ask_text():
+    """No key to offer: plain text (a one-option box is the same dead end)."""
+    return (
+        "{} The Jira ticket for this session is not set. Ask the user NOW, in plain "
+        "text (do not use AskUserQuestion), exactly: {} {} {}"
+    ).format(PRIORITY, quoted(QUESTION_TEXT), BLOCK_RULES, NO_WRITE)
+
+
+def nudge():
+    """Asked already, and the reply carried no decision."""
+    return (
+        "{} The Jira ticket for this session is still not set: the user's last "
+        "message carried no ticket id. Before anything else, tell the user exactly: "
+        "{} and wait for the reply. {} {}"
+    ).format(PRIORITY, quoted(NUDGE), BLOCK_RULES, NO_WRITE)
+
+
+def resolved(session_key):
+    """Answered: one line so the model knows the ticket (commits, PRs), and an
+    explicit instruction never to ask again in this session."""
+    return (
+        "Jira ticket for this session: {}. It was already confirmed by the user for "
+        "this whole session — do not ask about the Jira ticket again, even if the task, "
+        "branch or subject changes."
+    ).format(describe(session_key))
+
+
+def run_prompt(payload):
+    session_id = payload.get("session_id")
+    cwd = payload.get("cwd") or os.getcwd()
+    if not session_id:
+        return  # without a session there is nothing to attach the ticket to
+
+    session_file = store.ticket_file(session_id)
+    if session_file is None:
+        return
+    sdir = session_file.parent
+    session_key = store.read_ticket(session_id)
+
+    if session_key is None:
+        asked = sdir / ASKED_FILE
+        if asked.exists():
+            prompt = str(payload.get("prompt") or "").strip()
+            key = parse_answer(prompt) if len(prompt) <= TYPED_MAX else None
+            if key is not None:
+                record_ticket(session_file, payload, key)
+                msg = resolved(key)
+            else:
+                msg = nudge()
+        else:
+            write_text(asked, "")
+            bkey = branch_key(cwd)  # empty outside a repo, in Cowork, or without a key
+            msg = ask_box(bkey) if bkey else ask_text()
+    else:
+        msg = resolved(session_key)
+        # Keep the live session out of the prune window.
+        try:
+            os.utime(session_file, None)
+        except OSError:
+            pass
+
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": msg,
+        }
+    }))
+
+
+# --------------------------------------------------------------------------- #
+# PostToolUse (AskUserQuestion): persist the answer
+# --------------------------------------------------------------------------- #
+
+def is_jira_question(question):
+    """Only the fixed header counts. No fuzzy fallback on the question text:
+    an unrelated question that merely mentions Jira ("link the Jira ticket in
+    the PR?") must never be able to rewrite the session ticket."""
+    header = str(question.get("header") or "").strip().lower()
+    return header == QUESTION_HEADER.lower()
+
+
+def find_answer(question_text, tool_response):
+    """The answer to `question_text` out of the tool response. Structured
+    shape (what Claude Code stores): {"answers": {question: label}}. Fallback:
+    a text blob shaped `"<question>"="<answer>"` (the tool_result wording)."""
+    if isinstance(tool_response, dict):
+        answers = tool_response.get("answers")
+        if isinstance(answers, dict) and question_text in answers:
+            value = answers[question_text]
+            if isinstance(value, list):
+                value = value[0] if value else ""
+            return str(value)
+        text = tool_response.get("text") or tool_response.get("content") or ""
+    else:
+        text = tool_response or ""
+    if isinstance(text, list):  # content blocks
+        text = " ".join(str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in text)
+    text = str(text)
+    match = re.search(re.escape(quoted(question_text)) + r'\s*=\s*"((?:[^"\\]|\\.)*)"', text)
+    if match:
+        try:
+            return json.loads('"' + match.group(1) + '"')
+        except ValueError:
+            return match.group(1)
+    return None
+
+
+def parse_answer(text):
+    """Chosen label or free text -> validated key, `none`, or None when the
+    answer carries no decision (neither a key nor "sem ticket": the nudge comes
+    back with the next prompt)."""
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw:
+        return None
+    match = store.KEY_IN_TEXT_RE.search(raw)
+    if match:
+        return match.group(0).upper()
+    if NO_TICKET_ANSWER in raw.lower():
+        return store.NO_TICKET
+    return None
+
+
+def record_ticket(session_file, payload, key):
+    """The one place a ticket is recorded (box or typed reply): write it, prune
+    old sessions (once per session, since it is written once) and send the first
+    context record."""
+    write_text(session_file, key)
+    root = store.sessions_root()
+    if root is not None:
+        prune(root)
+    trigger_context(payload)
+
+
+def trigger_context(payload):
+    """The ticket just became known: hand the session to emit-session-context so
+    the first context record goes out now. Running it from here, after the write,
+    avoids the race of two hooks on the same event (Claude Code runs them in
+    parallel, so the context hook could read before this one writes). It only
+    spawns its detached sender and returns; its output is discarded."""
+    try:
+        script = Path(__file__).resolve().parent / "emit-session-context"
+        data = {
+            "hook_event_name": payload.get("hook_event_name"),
+            "session_id": payload.get("session_id"),
+            "cwd": payload.get("cwd"),
+            "prompt_id": payload.get("prompt_id"),
+        }
+        subprocess.run(
+            [sys.executable, str(script)],
+            input=json.dumps(data),
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def run_post_tool_use(payload):
+    session_file = store.ticket_file(payload.get("session_id"))
+    if session_file is None:
+        return
+    if store.read_ticket(payload.get("session_id")) is not None:
+        return  # asked once per session: an existing answer is never rewritten
+    tool_input = payload.get("tool_input") or {}
+    questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
+    if not isinstance(questions, list):
+        return
+    for question in questions:
+        if not isinstance(question, dict) or not is_jira_question(question):
+            continue
+        answer = find_answer(str(question.get("question") or ""), payload.get("tool_response"))
+        key = parse_answer(answer)
+        if key is not None:
+            record_ticket(session_file, payload, key)
+        return  # one Jira question per AskUserQuestion call
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        if payload.get("hook_event_name") == "PostToolUse":
+            if payload.get("tool_name") == "AskUserQuestion":
+                run_post_tool_use(payload)
+        else:
+            run_prompt(payload)
+    except Exception:
+        pass  # context enrichment must never break a session
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

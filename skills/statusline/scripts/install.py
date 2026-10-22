@@ -19,7 +19,6 @@ Prints `ok=true` on success, `ok=false` + stderr detail on failure.
 import argparse
 import io
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -76,7 +75,7 @@ def install():
 
 def remove():
     """Delete only the statusLine key. The pointer stays: it is harmless
-    and the session-start hook would recreate it anyway."""
+    and the refresh-plugin-root hook would recreate it anyway."""
     if SETTINGS.is_file():
         settings = load_settings()
         if settings.pop("statusLine", None) is not None:

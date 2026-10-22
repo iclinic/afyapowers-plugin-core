@@ -2,9 +2,8 @@
 """afyapowers-core conversation history renderer.
 
 SessionEnd hook. Reads the session transcript (JSONL) named on stdin and renders
-one interactive, self-contained HTML file per session under `.afyapowers/history/`,
-plus a regenerated index.html. Handles both Claude Code transcripts and Cursor
-transcripts (role at the top level; `conversation_id`/`workspace_roots` on stdin).
+one interactive, self-contained HTML file per session, plus a regenerated
+index.html.
 
 Subagents are not stored in the main transcript. Each `Agent` tool call records a
 `toolUseResult.outputFile` pointing to a separate JSONL holding that subagent's full
@@ -13,7 +12,7 @@ subagent conversations nested under the call that spawned them.
 
 Contract: this is observability only. It must NEVER block a session or crash a
 host. Any error -> exit 0 silently. Logs every session: into
-`.afyapowers/history/<agent>/` when a `.afyapowers/` dir exists, otherwise into a
+`.afyapowers/history/claude/` when a `.afyapowers/` dir exists, otherwise into a
 global per-project store under the Claude config dir.
 """
 
@@ -24,6 +23,15 @@ import json
 import html
 import tempfile
 from datetime import datetime
+
+sys.dont_write_bytecode = True  # no __pycache__ inside the installed plugin
+try:
+    import session_store as store  # hooks/session_store.py: config dir
+except Exception:
+    sys.exit(0)  # a broken module ends the hook in silence, like any other error
+
+# History subfolder; `claude` keeps the existing history in place.
+HISTORY_SUBDIR = "claude"
 
 
 # --------------------------------------------------------------------------- #
@@ -72,9 +80,6 @@ def role_of(entry):
     msg = entry.get("message")
     if isinstance(msg, dict) and msg.get("role"):
         return msg.get("role")
-    # Cursor transcripts put role at the top level, not under `message`.
-    if entry.get("role"):
-        return entry.get("role")
     return entry.get("type", "")
 
 
@@ -190,11 +195,7 @@ def render_subagent(tool_id, label, ctx, depth):
 
 
 def is_turn(entry):
-    """A renderable conversation turn, in either Claude or Cursor format.
-
-    Claude tags entries with a top-level `type`; Cursor does not, so fall back
-    to `role_of` (which reads Cursor's top-level `role`).
-    """
+    """A renderable conversation turn: a user or assistant entry with a message."""
     return role_of(entry) in ("user", "assistant") and bool(entry.get("message"))
 
 
@@ -477,64 +478,44 @@ def ensure_gitignore(afya_dir):
 # Main
 # --------------------------------------------------------------------------- #
 
-def resolve_agent(data):
-    """Identify the host IDE so its sessions get their own `history/<agent>/`.
-
-    Primary signal is argv[1], set explicitly by each per-agent hook config
-    (e.g. `render-history cursor`). If absent (a host that strips args), sniff
-    the stdin payload: Cursor sends `cursor_version`/`conversation_id`.
-    """
-    name = sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip() else ""
-    if not name:
-        if data.get("cursor_version") or data.get("conversation_id"):
-            name = "cursor"
-        else:
-            name = "claude"
-    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in name)
-    return safe or "unknown"
-
-
-def resolve_history_dir(cwd, agent):
-    """Pick where logs go. Every session is logged (no active-feature gate).
-
-    Sessions are grouped per agent (`history/<agent>/`) so that a repo opened by
-    more than one IDE keeps each agent's sessions and index separate.
+def resolve_history_dir(cwd):
+    """Pick where logs go. Every session is logged.
 
     - If `<cwd>/.afyapowers/` already exists -> log beside the workflow artifacts and
       keep history out of git. Never create `.afyapowers/` ourselves: its presence is
-      what marks a project as afyapowers-enabled (owned by the afyapowers plugin).
+      what marks a project as afyapowers-enabled (owned by afyapowers-dev).
     - Otherwise -> a global per-project store under the Claude config dir, so plain
       projects are logged without being touched.
     """
     afya_dir = os.path.join(cwd, ".afyapowers")
     if os.path.isdir(afya_dir):
         ensure_gitignore(afya_dir)
-        return os.path.join(afya_dir, "history", agent)
-    config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+        return os.path.join(afya_dir, "history", HISTORY_SUBDIR)
+    state = store.state_dir()
+    if state is None:
+        return None
     slug = os.path.abspath(cwd).replace(os.sep, "-").strip("-") or "root"
-    return os.path.join(config, "afyapowers-core", "history", slug, agent)
+    return os.path.join(str(state), "history", slug, HISTORY_SUBDIR)
 
 
 def run():
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
     transcript = data.get("transcript_path")
-    # Cursor sessionEnd gives `workspace_roots`/`conversation_id` instead of
-    # Claude's `cwd`/`session_id`.
-    roots = data.get("workspace_roots") or []
-    cwd = data.get("cwd") or (roots[0] if roots else None) or os.getcwd()
-    session_id = data.get("session_id") or data.get("conversation_id") or "session"
-    agent = resolve_agent(data)
+    cwd = data.get("cwd") or os.getcwd()
+    session_id = data.get("session_id") or "session"
 
     if not transcript or not os.path.isfile(transcript):
         return
 
-    history_dir = resolve_history_dir(cwd, agent)
+    history_dir = resolve_history_dir(cwd)
+    if history_dir is None:
+        return
     os.makedirs(history_dir, exist_ok=True)
 
     entries = read_transcript(transcript)
     root = os.path.realpath(os.path.dirname(transcript))
-    safe = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(session_id))
+    safe = store.safe_name(session_id)
     atomic_write(os.path.join(history_dir, safe + ".html"), render_html(session_id, entries, root))
     atomic_write(os.path.join(history_dir, "index.html"), render_index(history_dir))
 

@@ -8,11 +8,12 @@ PLUGIN_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$HOME/.claude/afyapowers-core" 2>/dev/null || true
 printf '%s\n' "$PLUGIN_ROOT" > "$HOME/.claude/afyapowers-core/plugin-root" 2>/dev/null || true
 
-# Warn if Python 3 is unavailable — every other hook of this plugin
-# (lang-directive, render-history, otel-context) and the status line are
-# Python. SessionStart cannot block, so this is a non-blocking warning only.
+# Warn the model if Python 3 is unavailable — every other hook of this plugin
+# and the status line are Python. SessionStart cannot block, so this is a
+# non-blocking warning only. SessionStart context must go under
+# hookSpecificOutput: a top-level `additionalContext` is silently dropped.
 if ! command -v python3 >/dev/null 2>&1; then
-  echo '{"additionalContext": "⚠️ Python 3 not found on PATH — afyapowers-core hooks (language directive, history logging, telemetry) and the status line will not work. Install Python 3.9+."}'
+  echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "⚠️ Python 3 not found on PATH — afyapowers-core hooks (Jira ticket, telemetry, language directive, history) and the status line will not work. Install Python 3.9+."}}'
   exit 0
 fi
 
